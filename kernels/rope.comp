@@ -2,15 +2,15 @@
 
 layout(local_size_x = 256) in;
 
-layout(binding = 0, std430) suppress readonly buffer InX {
+layout(binding = 0, std430) readonly buffer InX {
     float x[];
 };
 
-layout(binding = 1, std430) suppress readonly buffer InFreq {
+layout(binding = 1, std430) readonly buffer InFreq {
     float freq[];
 };
 
-layout(binding = 2, std430) suppress writeonly buffer OutY {
+layout(binding = 2, std430) writeonly buffer OutY {
     float y[];
 };
 
@@ -35,8 +35,8 @@ void main() {
     } else {
         float x0 = x[i];
         float x1 = x[i + head_dim / 2u * (1u)];
-        uint half = dim % (rope_dim / 2u);
-        float f = freq[half];
+        uint hf = dim % (rope_dim / 2u);
+        float f = freq[hf];
         float sin_f = sin(f);
         float cos_f = cos(f);
 

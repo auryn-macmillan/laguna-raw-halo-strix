@@ -2,15 +2,15 @@
 
 layout(local_size_x = 256) in;
 
-layout(binding = 0, std430) suppress readonly buffer InX {
+layout(binding = 0, std430) readonly buffer InX {
     float x[];
 };
 
-layout(binding = 1, std430) suppress readonly buffer InFreq {
+layout(binding = 1, std430) readonly buffer InFreq {
     float freq[];
 };
 
-layout(binding = 2, std430) suppress writeonly buffer OutY {
+layout(binding = 2, std430) writeonly buffer OutY {
     float y[];
 };
 
@@ -32,14 +32,14 @@ void main() {
 
     float rms = inversesqrt(mean_sq + eps);
 
-    uint half = n / 2u;
-    uint dim = i % half;
+    uint half_dim = n / 2u;
+    uint dim = i % half_dim;
     float f = freq[dim];
 
-    if (dim < half) {
-        y[i] = x[i] * cos(f) - x[i + half] * sin(f);
+    if (dim < half_dim) {
+        y[i] = x[i] * cos(f) - x[i + half_dim] * sin(f);
     } else {
-        uint d = dim - half;
-        y[i] = x[i - half] * sin(f) + x[i] * cos(f);
+        uint d = dim - half_dim;
+        y[i] = x[i - half_dim] * sin(f) + x[i] * cos(f);
     }
 }

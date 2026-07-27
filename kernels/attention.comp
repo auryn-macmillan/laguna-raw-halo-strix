@@ -2,15 +2,15 @@
 
 layout(local_size_x = 1) in;
 
-layout(binding = 0, std430) suppress readonly buffer InQ {
+layout(binding = 0, std430) readonly buffer InQ {
     float Q[];
 };
 
-layout(binding = 1, std430) suppress readonly buffer InK {
+layout(binding = 1, std430) readonly buffer InK {
     float K[];
 };
 
-layout(binding = 2, std430) suppress writeonly buffer OutScores {
+layout(binding = 2, std430) writeonly buffer OutScores {
     float scores[];
 };
 

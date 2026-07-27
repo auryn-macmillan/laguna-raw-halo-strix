@@ -2,11 +2,11 @@
 
 layout(local_size_x = 256) in;
 
-layout(binding = 0, std430) suppress readonly buffer InV {
+layout(binding = 0, std430) readonly buffer InV {
     float v[];
 };
 
-layout(binding = 1, std430) suppress writeonly buffer OutRep {
+layout(binding = 1, std430) writeonly buffer OutRep {
     float out_data[];
 };
 

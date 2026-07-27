@@ -2,12 +2,12 @@
 
 layout(local_size_x = 256) in;
 
-layout(binding = 0, std430) suppress readonly buffer InLogits {
+layout(binding = 0, std430) readonly buffer InLogits {
     float logits[];
 };
 
-layout(binding = 1, std430) suppress writeonly buffer OutSample {
-    uint sample[];
+layout(binding = 1, std430) writeonly buffer OutSample {
+    uint out_sample[];
 };
 
 layout(push_constant) uniform Push {
@@ -49,5 +49,5 @@ void main() {
         }
     }
 
-    sample[0] = result;
+    out_sample[0] = result;
 }

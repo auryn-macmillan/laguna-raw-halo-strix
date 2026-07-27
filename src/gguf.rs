@@ -116,6 +116,8 @@ impl TensorType {
             TensorType::NVFP4 => 832,
             TensorType::Q1_0 => 256,
             TensorType::IQ1_M => 512,
+            TensorType::Q2_Kv2 => 16,
+            TensorType::Q3_Kv2 => 112,
         }
     }
 
@@ -131,7 +133,7 @@ impl TensorType {
             TensorType::Q5_1 => 32,
             TensorType::Q8_0 => 32,
             TensorType::Q8_1 => 32,
-            TensorType::Q2_K | TensorType::Q3_K | TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K | TensorType::Q8_K => 256,
+            TensorType::Q2_K | TensorType::Q3_K | TensorType::Q4_K | TensorType::Q5_K | TensorType::Q6_K | TensorType::Q8_K | TensorType::Q2_Kv2 | TensorType::Q3_Kv2 => 256,
             TensorType::IQ2_XXS | TensorType::IQ2_XS | TensorType::IQ3_XXS | TensorType::IQ4_XS | TensorType::IQ3_S => 256,
             TensorType::IQ1_S | TensorType::IQ4_NL | TensorType::IQ1_M | TensorType::Q1_0 => 256,
             TensorType::IQ2_S | TensorType::TQ1_0 | TensorType::TQ2_0 | TensorType::MXFP4 | TensorType::NVFP4 => 256,
@@ -455,7 +457,7 @@ fn read_value(file: &mut File, type_id: u32) -> std::io::Result<GGUFValue> {
         8 => {
             let len = read_u64(file)?;
             let mut buf = vec![0u8; len as usize];
-            file.read_exact(&buf)?;
+            file.read_exact(&mut buf)?;
             let s = String::from_utf8_lossy(&buf).into_owned();
             Ok(GGUFValue::String(s))
         }

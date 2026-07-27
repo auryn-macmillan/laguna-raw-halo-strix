@@ -2,11 +2,11 @@
 
 layout(local_size_x = 256) in;
 
-layout(binding = 0, std430) suppress readonly buffer InBuf {
+layout(binding = 0, std430) readonly buffer InBuf {
     uint data[];
 };
 
-layout(binding = 1, std430) suppress writeonly buffer OutBuf {
+layout(binding = 1, std430) writeonly buffer OutBuf {
     float out_data[];
 };
 
@@ -55,7 +55,7 @@ void main() {
 
     float sum = 0.0;
     for (uint i = 0u; i < 32u; i++) {
-        int8_t q = int8(read_byte(offset + 2u + i));
+         int q = int(read_byte(offset + 2u + i));
         sum += float(q) * d;
     }
     out_data[idx] = sum;

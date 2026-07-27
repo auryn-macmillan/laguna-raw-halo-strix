@@ -2,11 +2,11 @@
 
 layout(local_size_x = 256) in;
 
-layout(binding = 0, std430) suppress readonly buffer InBuf {
+layout(binding = 0, std430) readonly buffer InBuf {
     uint data[];
 };
 
-layout(binding = 1, std430) suppress writeonly buffer OutBuf {
+layout(binding = 1, std430) writeonly buffer OutBuf {
     float out_data[];
 };
 

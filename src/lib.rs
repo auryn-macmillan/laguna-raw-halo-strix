@@ -93,7 +93,7 @@ pub fn run_test_dequant() {
     println!("test-dequant: PASS (bf16, 64 elements)");
 
     let mut data = vec![0u8; 34];
-    let h_bits = (0.5f32.bits() >> 16) as u16;
+    let h_bits = (0.5f32.to_bits() >> 16) as u16;
     data[0..2].copy_from_slice(&h_bits.to_le_bytes());
     for i in 0..32 {
         data[2 + i] = 1;
@@ -232,7 +232,7 @@ pub fn run_test_rope() {
     let layout = ctx.create_pipeline_layout(set_layout, 16);
     let pipeline = ctx.create_compute_pipeline(rope_shader, layout);
 
-    let total = n_heads * head_dim;
+    let total: u32 = n_heads * head_dim;
     let groups = total.div_ceil(256) as u32;
     ctx.submit_compute(pipeline, layout, set, &push_bytes, (groups, 1, 1));
 

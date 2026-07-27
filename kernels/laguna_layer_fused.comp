@@ -2,35 +2,35 @@
 
 layout(local_size_x = 256) in;
 
-layout(binding = 0, std430) suppress readonly buffer InX {
+layout(binding = 0, std430) readonly buffer InX {
     float x[];
 };
 
-layout(binding = 1, std430) suppress readonly buffer InAttnOut {
+layout(binding = 1, std430) readonly buffer InAttnOut {
     float attn_out[];
 };
 
-layout(binding = 2, std430) suppress readonly buffer InV {
+layout(binding = 2, std430) readonly buffer InV {
     float v_rep[];
 };
 
-layout(binding = 3, std430) suppress readonly buffer InGate {
+layout(binding = 3, std430) readonly buffer InGate {
     float gate[];
 };
 
-layout(binding = 4, std430) suppress writeonly buffer OutY {
+layout(binding = 4, std430) writeonly buffer OutY {
     float y[];
 };
 
-layout(binding = 5, std430) suppress readonly buffer InFFNGate {
+layout(binding = 5, std430) readonly buffer InFFNGate {
     float ffn_gate_w[];
 };
 
-layout(binding = 6, std430) suppress readonly buffer InFFNUp {
+layout(binding = 6, std430) readonly buffer InFFNUp {
     float ffn_up_w[];
 };
 
-layout(binding = 7, std430) suppress readonly buffer InFFNDown {
+layout(binding = 7, std430) readonly buffer InFFNDown {
     float ffn_down_w[];
 };
 

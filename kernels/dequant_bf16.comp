@@ -6,7 +6,7 @@ layout(binding = 0, std430) restrict readonly buffer InBuf {
     uint data[];
 };
 
-layout(binding = 1, std430) suppress writeonly buffer OutBuf {
+layout(binding = 1, std430) writeonly buffer OutBuf {
     float out_data[];
 };
 

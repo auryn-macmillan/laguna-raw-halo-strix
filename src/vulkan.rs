@@ -21,16 +21,16 @@ impl VulkanContext {
         let app_name = CString::new("laguna-raw").unwrap();
         let engine_name = CString::new("laguna-raw").unwrap();
 
-        let appinfo = vk::ApplicationInfo::builder()
+        let appinfo = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .application_version(0)
             .engine_name(&engine_name)
             .engine_version(0)
             .api_version(vk::API_VERSION_1_2);
 
-        let create_info = vk::InstanceCreateInfo::builder()
+        let create_info = vk::InstanceCreateInfo::default()
             .application_info(&appinfo)
-            .flags(vk::InstanceCreateFlags::CREATE_ENUMERATE_PORTABILITY_EXT);
+            .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
 
         let instance = unsafe {
             entry
@@ -57,14 +57,14 @@ impl VulkanContext {
                 .expect("no compute queue found") as u32
         };
 
-        let device_features = vk::PhysicalDeviceFeatures::builder();
+        let device_features = vk::PhysicalDeviceFeatures::default();
 
         let queue_priority = [1.0f32];
-        let queue_info = vk::DeviceQueueCreateInfo::builder()
+        let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&queue_priority);
 
-        let device_create_info = vk::DeviceCreateInfo::builder()
+        let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_features(&device_features);
 
@@ -74,11 +74,11 @@ impl VulkanContext {
                 .expect("device creation failed")
         };
 
-        let queue = unsafe { device.get_queue(queue_family_index, 0) };
+        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(pdevice) };
 
-        let command_pool_info = vk::CommandPoolCreateInfo::builder()
+        let command_pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
@@ -118,16 +118,15 @@ impl VulkanContext {
         let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = Vec::with_capacity(count);
         for i in 0..count {
             bindings.push(
-                vk::DescriptorSetLayoutBinding::builder()
+                vk::DescriptorSetLayoutBinding::default()
                     .binding(i as u32)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                    .build(),
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
             );
         }
 
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings);
 
         unsafe {
@@ -143,7 +142,7 @@ impl VulkanContext {
             descriptor_count: count as u32,
         };
 
-        let pool_info = vk::DescriptorPoolCreateInfo::builder()
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(std::slice::from_ref(&pool_size))
             .max_sets(count as u32);
 
@@ -159,7 +158,7 @@ impl VulkanContext {
         pool: vk::DescriptorPool,
         layout: vk::DescriptorSetLayout,
     ) -> vk::DescriptorSet {
-        let alloc_info = vk::DescriptorSetAllocateInfo::builder()
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(std::slice::from_ref(&layout));
 
@@ -185,7 +184,7 @@ impl VulkanContext {
             range: size,
         };
 
-        let write = vk::WriteDescriptorSet::builder()
+        let write = vk::WriteDescriptorSet::default()
             .dst_set(set)
             .dst_binding(binding as u32)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -202,17 +201,19 @@ impl VulkanContext {
         push_size: usize,
     ) -> vk::PipelineLayout {
         let set_layouts = [set_layout];
-        let mut pipeline_layout_info =
-            vk::PipelineLayoutCreateInfo::builder().set_layouts(&set_layouts);
+        let push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(push_size as u32);
 
-        if push_size > 0 {
-            let push_range = vk::PushConstantRange::builder()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .offset(0)
-                .size(push_size as u32)
-                .build();
-            pipeline_layout_info = pipeline_layout_info.push_constants(std::slice::from_ref(&push_range));
-        }
+        let pipeline_layout_info = if push_size > 0 {
+            vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(std::slice::from_ref(&push_range))
+        } else {
+            vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+        };
 
         unsafe {
             self.device
@@ -228,12 +229,12 @@ impl VulkanContext {
     ) -> vk::Pipeline {
         let entry_name = CString::new("main").unwrap();
 
-        let shader_stage_info = vk::PipelineShaderStageCreateInfo::builder()
+        let shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(&entry_name);
 
-        let pipeline_info = vk::ComputePipelineCreateInfo::builder()
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
             .stage(shader_stage_info)
             .layout(layout);
 
@@ -258,7 +259,7 @@ impl VulkanContext {
         push: &[u8],
         dims: (u32, u32, u32),
     ) {
-        let command_buffer_alloc_info = vk::CommandBufferAllocateInfo::builder()
+        let command_buffer_alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
@@ -271,7 +272,7 @@ impl VulkanContext {
 
         let command_buffer = command_buffers[0];
 
-        let begin_info = vk::CommandBufferBeginInfo::builder()
+        let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         unsafe {
@@ -291,6 +292,7 @@ impl VulkanContext {
                 layout,
                 0,
                 std::slice::from_ref(&set),
+                &[],
             );
 
             if !push.is_empty() {
@@ -311,14 +313,14 @@ impl VulkanContext {
                 .expect("end command buffer failed");
         }
 
-        let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::empty());
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::default());
         let fence = unsafe {
             self.device
                 .create_fence(&fence_info, None)
                 .expect("fence creation failed")
         };
 
-        let submit_info = vk::SubmitInfo::builder()
+        let submit_info = vk::SubmitInfo::default()
             .command_buffers(std::slice::from_ref(&command_buffer));
 
         unsafe {
@@ -351,7 +353,7 @@ impl GpuBuffer {
         usage: vk::BufferUsageFlags,
         mem_flags: vk::MemoryPropertyFlags,
     ) -> Self {
-        let buffer_info = vk::BufferCreateInfo::builder()
+        let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -366,12 +368,12 @@ impl GpuBuffer {
 
         let mem_type_index = find_memory_type(
             &ctx.memory_properties,
-            mem_reqs.memory_requirements,
+            mem_reqs.memory_type_bits,
             mem_flags,
         )
         .expect("failed to find suitable memory type");
 
-        let alloc_info = vk::MemoryAllocateInfo::builder()
+        let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type_index);
 

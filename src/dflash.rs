@@ -590,21 +590,12 @@ impl DFlashModel {
         }
 
         if let Some(output_norm_w) = &self.output_norm_w {
-            let push: [u8; 12] = {
-                let mut b = [0u8; 12];
-                b[..4].copy_from_slice(&(n_embd as u32).to_le_bytes());
-                let eps: f32 = 1e-5;
-                b[4..8].copy_from_slice(&eps.to_le_bytes());
-                b[8..].copy_from_slice(&0u32.to_le_bytes());
-                b
-            };
             dispatch_rmsnorm(
                 ctx,
                 &rmsnorm_shader,
                 output_norm_w,
                 &bufs.x,
                 &bufs.x,
-                &push,
                 n_embd,
             );
         }
@@ -794,7 +785,7 @@ fn dispatch_rope(
 
     let layout = ctx.create_pipeline_layout(set_layout, 16);
     let pipeline = ctx.create_compute_pipeline(*shader, layout);
-    let total = push[0] as usize * push[1] as usize * push[2] as usize;
+    let total: u32 = push[0] * push[1] * push[2];
     let groups = total.div_ceil(256);
     ctx.submit_compute(pipeline, layout, set, &push_bytes, (groups, 1, 1));
 }
@@ -944,7 +935,7 @@ mod tests {
     #[test]
     fn test_dequant_q8_0() {
         let mut data = vec![0u8; 34];
-        let h_bits = (0.5f32.bits() >> 16) as u16;
+        let h_bits = (0.5f32.to_bits() >> 16) as u16;
         data[0..2].copy_from_slice(&h_bits.to_le_bytes());
         for i in 0..32 {
             data[2 + i] = 1;
