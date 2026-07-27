@@ -36,6 +36,10 @@ fn main() {
                 .unwrap_or(0);
             laguna_raw::run_forward(path, token_id);
         }
+        "encode" => {
+            let path = Path::new(&args[2]);
+            laguna_raw::run_forward_encode(path);
+        }
         "test-dequant" => {
             laguna_raw::run_test_dequant();
         }

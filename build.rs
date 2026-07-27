@@ -18,6 +18,7 @@ fn main() {
     fs::create_dir_all(out_dir_path).expect("failed to create OUT_DIR");
 
     let shaders = [
+        "enc_aux_norm.comp",
         "dequant.comp",
         "dequant_bf16.comp",
         "dequant_q4k.comp",

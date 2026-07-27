@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) readonly buffer InX {
+    float x[];
+};
+
+layout(binding = 1, std430) readonly buffer InW {
+    float w[];
+};
+
+layout(binding = 2, std430) writeonly buffer OutY {
+    float y[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_feat;
+    uint n_aux;
+    uint n_tokens;
+    float eps;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = n_feat * n_aux * n_tokens;
+    if (idx >= total) return;
+
+    uint tok = idx / (n_feat * n_aux);
+    uint aux = (idx % (n_feat * n_aux)) / n_feat;
+    uint feat = idx % n_feat;
+
+    uint base = (aux + tok * n_aux) * n_feat;
+    float mean_sq = 0.0;
+    for (uint i = 0u; i < n_feat; i++) {
+        float v = x[base + i];
+        mean_sq += v * v;
+    }
+    mean_sq /= float(n_feat);
+    float rms = inversesqrt(mean_sq + eps);
+
+    y[idx] = x[idx] * rms * w[feat + aux * n_feat];
+}

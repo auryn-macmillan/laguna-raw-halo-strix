@@ -77,6 +77,19 @@ pub fn run_forward(path: &Path, token_id: usize) {
     }
 }
 
+pub fn run_forward_encode(path: &Path) {
+    let model = DFlashModel::load(path).expect("failed to load model");
+    let n_embd = model.embedding_length();
+    let n_embd_inp = model.n_embd_inp();
+
+    let dummy_features = vec![0.0f32; n_embd_inp];
+    let logits = model.forward_encode_and_decode(&dummy_features);
+    println!("encode+decode complete, {} logits", logits.len());
+    for (i, v) in logits.iter().enumerate().take(10) {
+        println!("  logit[{}] = {}", i, v);
+    }
+}
+
 pub fn run_test_dequant() {
     let data: Vec<u8> = (0..64)
         .flat_map(|i| {

@@ -25,6 +25,8 @@ pub struct DFlashModel {
     pub tok_embeddings: Option<GpuBuffer>,
     pub output_norm_w: Option<GpuBuffer>,
     pub fc_weight: Option<GpuBuffer>,
+    pub enc_aux_norm_w: Option<GpuBuffer>,
+    pub enc_output_norm_w: Option<GpuBuffer>,
     pub ctx: VulkanContext,
 }
 
@@ -94,12 +96,24 @@ impl DFlashModel {
             .cloned()
             .map(|t| model.upload_tensor_f32(&ctx, &t));
 
+        let enc_aux_norm_w = model
+            .tensor("enc.aux_norm.weight")
+            .cloned()
+            .map(|t| model.upload_tensor_f32(&ctx, &t));
+
+        let enc_output_norm_w = model
+            .tensor("enc.output_norm.weight")
+            .cloned()
+            .map(|t| model.upload_tensor_f32(&ctx, &t));
+
         Ok(DFlashModel {
             model,
             layers,
             tok_embeddings,
             output_norm_w,
             fc_weight,
+            enc_aux_norm_w,
+            enc_output_norm_w,
             ctx,
         })
     }
@@ -135,6 +149,93 @@ impl DFlashModel {
     pub fn target_layers(&self) -> &[i64] {
         &self.model.target_layers
     }
+
+    pub fn n_embd_inp(&self) -> usize {
+        self.model.embedding_length * self.model.target_layers.len()
+    }
+
+    pub fn encode(&self, target_features: &[f32]) -> Vec<f32> {
+        let ctx = &self.ctx;
+        let n_embd = self.model.embedding_length;
+        let n_aux = self.model.target_layers.len();
+        let n_embd_inp = n_embd * n_aux;
+
+        let enc_aux_norm_w = self.enc_aux_norm_w.as_ref().expect("enc_aux_norm_w");
+        let fc_w = self.fc_weight.as_ref().expect("fc_weight");
+        let enc_output_norm_w = self.enc_output_norm_w.as_ref().expect("enc_output_norm_w");
+
+        let x_buf = upload_f32(ctx, target_features);
+        let normed_buf = upload_f32(ctx, &vec![0.0f32; n_embd_inp]);
+        let proj_out_buf = upload_f32(ctx, &vec![0.0f32; n_embd]);
+        let final_out_buf = upload_f32(ctx, &vec![0.0f32; n_embd]);
+
+        let enc_aux_norm_shader = ctx.create_shader_module(crate::include_spv!(enc_aux_norm));
+        let proj_shader = ctx.create_shader_module(crate::include_spv!(proj));
+        let rmsnorm_shader = ctx.create_shader_module(crate::include_spv!(rmsnorm));
+
+        let eps: f32 = 1e-5;
+        let push_enc: [u8; 16] = {
+            let mut b = [0u8; 16];
+            b[..4].copy_from_slice(&(n_embd as u32).to_le_bytes());
+            b[4..8].copy_from_slice(&(n_aux as u32).to_le_bytes());
+            b[8..12].copy_from_slice(&1u32.to_le_bytes());
+            b[12..].copy_from_slice(&eps.to_le_bytes());
+            b
+        };
+
+        dispatch_enc_aux_norm(
+            ctx,
+            &enc_aux_norm_shader,
+            &x_buf,
+            enc_aux_norm_w,
+            &normed_buf,
+            n_embd,
+            n_aux,
+            n_embd_inp,
+        );
+
+        let push_proj: [u8; 8] = {
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&(n_embd_inp as u32).to_le_bytes());
+            b[4..].copy_from_slice(&(n_embd as u32).to_le_bytes());
+            b
+        };
+
+        let set_layout = ctx.create_descriptor_set_layout(3);
+        let pool = ctx.create_descriptor_pool(3);
+        let set = ctx.allocate_descriptor_set(pool, set_layout);
+        ctx.write_buffer_descriptor(set, 0, normed_buf.buffer, normed_buf.size);
+        ctx.write_buffer_descriptor(set, 1, fc_w.buffer, fc_w.size);
+        ctx.write_buffer_descriptor(set, 2, proj_out_buf.buffer, proj_out_buf.size);
+        let layout = ctx.create_pipeline_layout(set_layout, 8);
+        let pipeline = ctx.create_compute_pipeline(proj_shader, layout);
+        let groups = n_embd_u32(n_embd).div_ceil(256);
+        ctx.submit_compute(pipeline, layout, set, &push_proj, (groups, 1, 1));
+
+        let push_rms: [u8; 8] = {
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&(n_embd as u32).to_le_bytes());
+            b[4..].copy_from_slice(&eps.to_le_bytes());
+            b
+        };
+
+        let set_layout2 = ctx.create_descriptor_set_layout(3);
+        let pool2 = ctx.create_descriptor_pool(3);
+        let set2 = ctx.allocate_descriptor_set(pool2, set_layout2);
+        ctx.write_buffer_descriptor(set2, 0, proj_out_buf.buffer, proj_out_buf.size);
+        ctx.write_buffer_descriptor(set2, 1, enc_output_norm_w.buffer, enc_output_norm_w.size);
+        ctx.write_buffer_descriptor(set2, 2, final_out_buf.buffer, final_out_buf.size);
+        let layout2 = ctx.create_pipeline_layout(set_layout2, 8);
+        let pipeline2 = ctx.create_compute_pipeline(rmsnorm_shader, layout2);
+        let groups2 = n_embd_u32(n_embd).div_ceil(256);
+        ctx.submit_compute(pipeline2, layout2, set2, &push_rms, (groups2, 1, 1));
+
+        final_out_buf.read_f32(n_embd)
+    }
+}
+
+fn n_embd_u32(n: usize) -> u32 {
+    n as u32
 }
 
 #[allow(dead_code)]
@@ -622,6 +723,135 @@ impl DFlashModel {
             bufs.x.read_f32(n_embd)
         }
     }
+
+    pub fn forward_from_input(&self, bufs: &ForwardBuffers, input: &[f32]) -> Vec<f32> {
+        let n_embd = self.embedding_length();
+        let n_heads = self.head_count();
+        let n_kv_heads = self.head_count_kv();
+        let head_dim_per_head = self.head_dim();
+        let n_ff = self.ffn_length();
+        let rope_dim = self.rope_dim();
+
+        let ctx = &self.ctx;
+
+        bufs.x.upload(&f32_to_bytes(input));
+
+        let rmsnorm_shader = ctx.create_shader_module(crate::include_spv!(rmsnorm));
+        let proj_shader = ctx.create_shader_module(crate::include_spv!(proj));
+        let repeat_v_shader = ctx.create_shader_module(crate::include_spv!(repeat_v));
+        let qk_norm_shader = ctx.create_shader_module(crate::include_spv!(qk_norm));
+        let rope_shader = ctx.create_shader_module(crate::include_spv!(rope));
+        let activation_shader = ctx.create_shader_module(crate::include_spv!(activation));
+        let gate_mul_shader = ctx.create_shader_module(crate::include_spv!(gate_mul));
+        let add_shader = ctx.create_shader_module(crate::include_spv!(add));
+
+        let freq: Vec<f32> = (0..rope_dim / 2)
+            .map(|i| {
+                let base = self
+                    .model
+                    .reader
+                    .metadata
+                    .rope_freq_base
+                    .unwrap_or(500000.0);
+                let dim = rope_dim as f32;
+                1.0 / base.powf((2.0 * i as f32) / dim)
+            })
+            .collect();
+        let freq_buf = upload_f32(ctx, &freq);
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            let n_heads_x_hd = n_heads * head_dim_per_head;
+
+            let attn_norm_w = layer.attn_norm_w.as_ref().expect("attn_norm_w");
+            let attn_q_w = layer.attn_q_w.as_ref().expect("attn_q_w");
+            let attn_k_w = layer.attn_k_w.as_ref().expect("attn_k_w");
+            let attn_v_w = layer.attn_v_w.as_ref().expect("attn_v_w");
+            let attn_output_w = layer.attn_output_w.as_ref().expect("attn_output_w");
+            let attn_q_norm_w = layer.attn_q_norm_w.as_ref().expect("attn_q_norm_w");
+            let attn_k_norm_w = layer.attn_k_norm_w.as_ref().expect("attn_k_norm_w");
+            let attn_gate_w = layer.attn_gate_w.as_ref().expect("attn_gate_w");
+            let ffn_norm_w = layer.ffn_norm_w.as_ref().expect("ffn_norm_w");
+            let ffn_gate_w = layer.ffn_gate_w.as_ref().expect("ffn_gate_w");
+            let ffn_up_w = layer.ffn_up_w.as_ref().expect("ffn_up_w");
+            let ffn_down_w = layer.ffn_down_w.as_ref().expect("ffn_down_w");
+
+            dispatch_rmsnorm(
+                ctx, &rmsnorm_shader, attn_norm_w, &bufs.x, &bufs.norm_x, n_embd,
+            );
+
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, attn_q_w, &bufs.q, n_embd, n_heads_x_hd);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, attn_k_w, &bufs.k, n_embd, n_kv_heads * head_dim_per_head);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, attn_v_w, &bufs.v, n_embd, n_kv_heads * head_dim_per_head);
+
+            let push_ropec = [n_heads as u32, head_dim_per_head as u32, 1u32, rope_dim as u32];
+            dispatch_qk_norm(ctx, &qk_norm_shader, &bufs.q, attn_q_norm_w, &bufs.q_normed, n_heads, head_dim_per_head, n_heads_x_hd);
+            dispatch_qk_norm(ctx, &qk_norm_shader, &bufs.k, attn_k_norm_w, &bufs.k_normed, n_kv_heads, head_dim_per_head, n_kv_heads * head_dim_per_head);
+
+            dispatch_rope(ctx, &rope_shader, &bufs.q_normed, &freq_buf, &bufs.q, &push_ropec);
+            dispatch_rope(ctx, &rope_shader, &bufs.k_normed, &freq_buf, &bufs.k, &push_ropec);
+
+            let v_rep_out = GpuBuffer::new(
+                ctx, (n_heads_x_hd * 4) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            dispatch_repeat_v(ctx, &repeat_v_shader, &bufs.v, &v_rep_out, n_kv_heads * head_dim_per_head, n_heads_x_hd);
+
+            let gate_data = dispatch_proj_read(ctx, &proj_shader, &bufs.norm_x, attn_gate_w, n_embd, n_heads);
+            let gate_f32: Vec<f32> = gate_data.iter()
+                .map(|&g| if g > 20.0 { g } else { (1.0 + g.exp()).ln() })
+                .collect();
+            let gate_bytes = f32_to_bytes(&gate_f32);
+            let gate_buf = GpuBuffer::new(
+                ctx, (n_heads * 4) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            gate_buf.upload(&gate_bytes);
+
+            dispatch_gate_mul(ctx, &gate_mul_shader, &bufs.attn_out, &v_rep_out, &gate_buf, n_heads_x_hd, n_heads, head_dim_per_head);
+
+            dispatch_proj(ctx, &proj_shader, &bufs.attn_out, attn_output_w, &bufs.ffn_out, n_heads_x_hd, n_embd);
+            dispatch_add(ctx, &add_shader, &bufs.x, &bufs.ffn_out, &bufs.x, n_embd);
+
+            dispatch_rmsnorm(ctx, &rmsnorm_shader, ffn_norm_w, &bufs.x, &bufs.norm_x, n_embd);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, ffn_gate_w, &bufs.ffn_gate, n_embd, n_ff);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, ffn_up_w, &bufs.ffn_up, n_embd, n_ff);
+            dispatch_activation(ctx, &activation_shader, &bufs.ffn_gate, &bufs.ffn_up, &bufs.ffn_h, n_ff);
+            dispatch_proj(ctx, &proj_shader, &bufs.ffn_h, ffn_down_w, &bufs.ffn_out, n_ff, n_embd);
+            dispatch_add(ctx, &add_shader, &bufs.x, &bufs.ffn_out, &bufs.x, n_embd);
+        }
+
+        if let Some(output_norm_w) = &self.output_norm_w {
+            dispatch_rmsnorm(ctx, &rmsnorm_shader, output_norm_w, &bufs.x, &bufs.x, n_embd);
+        }
+
+        if let Some(fc_w) = &self.fc_weight {
+            let vocab_size = fc_w.size as usize / (n_embd * 4);
+            let logits_buf = GpuBuffer::new(
+                ctx, (vocab_size * 4) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+            dispatch_proj(ctx, &proj_shader, &bufs.x, fc_w, &logits_buf, n_embd, vocab_size);
+            logits_buf.read_f32(vocab_size)
+        } else {
+            bufs.x.read_f32(n_embd)
+        }
+    }
+
+    pub fn forward_encode_and_decode(&self, target_features: &[f32]) -> Vec<f32> {
+        let n_embd = self.embedding_length();
+        let bufs = ForwardBuffers::new(
+            &self.ctx, n_embd, self.head_count(), self.head_count_kv(),
+            self.head_dim(), self.ffn_length(),
+        );
+
+        let enc_output = self.encode(target_features);
+
+        self.forward_from_input(&bufs, &enc_output)
+    }
 }
 
 fn dispatch_rmsnorm(
@@ -815,6 +1045,41 @@ fn dispatch_repeat_v(
     let layout = ctx.create_pipeline_layout(set_layout, 8);
     let pipeline = ctx.create_compute_pipeline(*shader, layout);
     let groups = n_out.div_ceil(256) as u32;
+    ctx.submit_compute(pipeline, layout, set, &push, (groups, 1, 1));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_enc_aux_norm(
+    ctx: &VulkanContext,
+    shader: &vk::ShaderModule,
+    x: &GpuBuffer,
+    aux_norm_w: &GpuBuffer,
+    out: &GpuBuffer,
+    n_feat: usize,
+    n_aux: usize,
+    n_total: usize,
+) {
+    let eps: f32 = 1e-5;
+    let push: [u8; 16] = {
+        let mut b = [0u8; 16];
+        b[..4].copy_from_slice(&(n_feat as u32).to_le_bytes());
+        b[4..8].copy_from_slice(&(n_aux as u32).to_le_bytes());
+        b[8..12].copy_from_slice(&1u32.to_le_bytes());
+        b[12..].copy_from_slice(&eps.to_le_bytes());
+        b
+    };
+
+    let set_layout = ctx.create_descriptor_set_layout(3);
+    let pool = ctx.create_descriptor_pool(3);
+    let set = ctx.allocate_descriptor_set(pool, set_layout);
+
+    ctx.write_buffer_descriptor(set, 0, x.buffer, x.size);
+    ctx.write_buffer_descriptor(set, 1, aux_norm_w.buffer, aux_norm_w.size);
+    ctx.write_buffer_descriptor(set, 2, out.buffer, out.size);
+
+    let layout = ctx.create_pipeline_layout(set_layout, 16);
+    let pipeline = ctx.create_compute_pipeline(*shader, layout);
+    let groups = n_total.div_ceil(256) as u32;
     ctx.submit_compute(pipeline, layout, set, &push, (groups, 1, 1));
 }
 
