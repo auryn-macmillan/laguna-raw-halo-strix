@@ -1,0 +1,62 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) suppress readonly buffer InBuf {
+    uint data[];
+};
+
+layout(binding = 1, std430) suppress writeonly buffer OutBuf {
+    float out_data[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_elements;
+};
+
+uint read_byte(uint offset) {
+    uint word = data[offset / 4u];
+    return (word >> ((offset % 4u) * 8u)) & 0xFFu;
+}
+
+float half_to_f32(uint h_bits) {
+    uint sign = h_bits & 0x8000u;
+    uint exp = (h_bits >> 10u) & 0x1Fu;
+    uint mant = h_bits & 0x3FFu;
+
+    if (exp == 0u) {
+        if (mant == 0u) {
+            return uintBitsToFloat(sign << 16u);
+        }
+        uint f_exp = (1u - 15u + 127u) << 10u;
+        uint f_bits = (sign << 16u) | f_exp | (mant << 13u);
+        return uintBitsToFloat(f_bits);
+    }
+    if (exp == 31u) {
+        if (mant == 0u) {
+            return uintBitsToFloat((sign << 16u) | 0x7F800000u);
+        }
+        return uintBitsToFloat((sign << 16u) | 0x7F800000u | (mant << 13u));
+    }
+
+    uint f_exp = ((exp - 15u + 127u) << 10u);
+    uint f_bits = (sign << 16u) | f_exp | (mant << 13u);
+    return uintBitsToFloat(f_bits);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n_elements) return;
+
+    uint offset = idx * 34u;
+    uint h_bits = read_byte(offset) | (read_byte(offset + 1u) << 8u);
+
+    float d = half_to_f32(h_bits);
+
+    float sum = 0.0;
+    for (uint i = 0u; i < 32u; i++) {
+        int8_t q = int8(read_byte(offset + 2u + i));
+        sum += float(q) * d;
+    }
+    out_data[idx] = sum;
+}

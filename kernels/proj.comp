@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) suppress readonly buffer InX {
+    float x[];
+};
+
+layout(binding = 1, std430) suppress readonly buffer InW {
+    float w[];
+};
+
+layout(binding = 2, std430) suppress writeonly buffer OutC {
+    float c[];
+};
+
+layout(push_constant) uniform Push {
+    uint k;
+    uint n;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+
+    float acc = 0.0;
+    for (uint j = 0u; j < k; j++) {
+        acc += x[j] * w[j * n + i];
+    }
+    c[i] = acc;
+}

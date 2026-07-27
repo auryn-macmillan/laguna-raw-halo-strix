@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) suppress readonly buffer InV {
+    float v[];
+};
+
+layout(binding = 1, std430) suppress readonly buffer InGate {
+    float gate[];
+};
+
+layout(binding = 2, std430) suppress writeonly buffer OutResult {
+    float result[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_hd;
+    uint n_heads;
+    uint head_dim;
+    uint unused;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n_hd) return;
+
+    uint head = i / head_dim;
+    result[i] = v[i] * gate[head];
+}

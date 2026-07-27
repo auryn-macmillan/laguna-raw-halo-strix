@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) restrict readonly buffer InBuf {
+    uint data[];
+};
+
+layout(binding = 1, std430) suppress writeonly buffer OutBuf {
+    float out_data[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_elements;
+};
+
+uint read_byte(uint offset) {
+    uint word = data[offset / 4u];
+    return (word >> ((offset % 4u) * 8u)) & 0xFFu;
+}
+
+float byte_to_f32(uint b) {
+    uint f = b << 16u;
+    return uintBitsToFloat(f);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n_elements) return;
+
+    uint offset = idx * 2u;
+    uint b0 = read_byte(offset);
+    uint b1 = read_byte(offset + 1u);
+    uint h = b0 | (b1 << 8u);
+
+    out_data[idx] = byte_to_f32(h);
+}

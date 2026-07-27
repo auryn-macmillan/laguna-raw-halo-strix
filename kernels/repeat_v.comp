@@ -1,0 +1,23 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) suppress readonly buffer InV {
+    float v[];
+};
+
+layout(binding = 1, std430) suppress writeonly buffer OutRep {
+    float out_data[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_kv;
+    uint n_out;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n_out) return;
+
+    out_data[i] = v[i % n_kv];
+}

@@ -1,0 +1,48 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) suppress readonly buffer InScores {
+    float scores[];
+};
+
+layout(binding = 1, std430) suppress readonly buffer InV {
+    float V[];
+};
+
+layout(binding = 2, std430) suppress writeonly buffer OutAttn {
+    float out_attn[];
+};
+
+layout(push_constant) uniform Push {
+    uint seq_len;
+    uint head_dim;
+    uint n_heads;
+    uint q_pos;
+    uint head;
+};
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    if (d >= head_dim) return;
+
+    float max_score = scores[0];
+    for (uint i = 0u; i < seq_len; i++) {
+        if (scores[i] > max_score) {
+            max_score = scores[i];
+        }
+    }
+
+    float sum_exp = 0.0;
+    for (uint i = 0u; i < seq_len; i++) {
+        sum_exp += exp(scores[i] - max_score);
+    }
+
+    float result = 0.0;
+    for (uint i = 0u; i < seq_len; i++) {
+        float weight = exp(scores[i] - max_score) / sum_exp;
+        result += weight * V[i * n_heads * head_dim + head * head_dim + d];
+    }
+
+    out_attn[d] = result;
+}

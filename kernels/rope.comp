@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) suppress readonly buffer InX {
+    float x[];
+};
+
+layout(binding = 1, std430) suppress readonly buffer InFreq {
+    float freq[];
+};
+
+layout(binding = 2, std430) suppress writeonly buffer OutY {
+    float y[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_heads;
+    uint head_dim;
+    uint n_seq;
+    uint rope_dim;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n_heads * head_dim * n_seq) return;
+
+    uint seq = i / (n_heads * head_dim);
+    uint idx = i % (n_heads * head_dim);
+    uint head = idx / head_dim;
+    uint dim = idx % head_dim;
+
+    if (dim >= rope_dim) {
+        y[i] = x[i];
+    } else {
+        float x0 = x[i];
+        float x1 = x[i + head_dim / 2u * (1u)];
+        uint half = dim % (rope_dim / 2u);
+        float f = freq[half];
+        float sin_f = sin(f);
+        float cos_f = cos(f);
+
+        if (dim < rope_dim / 2u) {
+            y[i] = x0 * cos_f - x1 * sin_f;
+        } else {
+            y[i] = x0 * sin_f + x1 * cos_f;
+        }
+    }
+}

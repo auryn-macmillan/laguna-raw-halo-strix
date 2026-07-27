@@ -1,0 +1,11 @@
+[package]
+name = "laguna-raw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = { version = "0.38", features = ["loaded"] }
+
+[profile.release]
+opt-level = 3
+lto = false

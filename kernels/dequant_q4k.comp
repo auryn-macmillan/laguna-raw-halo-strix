@@ -1,0 +1,57 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) suppress readonly buffer InBuf {
+    uint data[];
+};
+
+layout(binding = 1, std430) suppress writeonly buffer OutBuf {
+    float out_data[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_elements;
+};
+
+uint read_byte(uint offset) {
+    uint word = data[offset / 4u];
+    return (word >> ((offset % 4u) * 8u)) & 0xFFu;
+}
+
+float q4k_dequant_block(uint base, uint n_out) {
+    uint h_bits = read_byte(base) | (read_byte(base + 1u) << 8u);
+    float d = uintBitsToFloat((h_bits << 16u));
+
+    uint k4_h = read_byte(base + 2u) | (read_byte(base + 3u) << 8u);
+    float k4 = uintBitsToFloat((k4_h << 16u));
+
+    uint signs_h = read_byte(base + 4u) | (read_byte(base + 5u) << 8u);
+    float signs = uintBitsToFloat((signs_h << 16u));
+
+    float acc = 0.0;
+    for (uint i = 0u; i < 14u; i++) {
+        uint b = read_byte(base + 6u + i);
+        uint ls = (b >> 4u) & 0x7u;
+        uint ms = b & 0x7u;
+
+        if (2u * i < n_out) {
+            float q = float(ls);
+            float s = (signs < 0.0) ? -1.0 : 1.0;
+            acc += (q * d + s * k4);
+        }
+        if (2u * i + 1u < n_out) {
+            float q = float(ms);
+            float s = (signs < 0.0) ? -1.0 : 1.0;
+            acc += (q * d + s * k4);
+        }
+        if (signs < 0.0) signs += 1.0;
+    }
+    return acc;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n_elements) return;
+    out_data[idx] = q4k_dequant_block(idx * 16u, 14u);
+}

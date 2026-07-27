@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0, std430) suppress readonly buffer InQ {
+    float Q[];
+};
+
+layout(binding = 1, std430) suppress readonly buffer InK {
+    float K[];
+};
+
+layout(binding = 2, std430) suppress writeonly buffer OutScores {
+    float scores[];
+};
+
+layout(push_constant) uniform Push {
+    uint head;
+    uint head_dim;
+    uint seq_len;
+    uint n_heads;
+    float scale;
+    uint q_pos;
+    uint use_sliding_window;
+    uint window_size;
+};
+
+void main() {
+    uint pos = gl_GlobalInvocationID.x;
+    if (pos >= seq_len) return;
+
+    uint q_offset = (q_pos * n_heads + head) * head_dim;
+    uint k_offset = (pos * n_heads + head) * head_dim;
+
+    float dot = 0.0;
+    for (uint d = 0u; d < head_dim; d++) {
+        dot += Q[q_offset + d] * K[k_offset + d];
+    }
+
+    float score = dot * scale;
+
+    if (pos > q_pos) {
+        score = -1e30;
+    }
+
+    if (use_sliding_window == 1u && q_pos - pos > window_size) {
+        score = -1e30;
+    }
+
+    scores[pos] = score;
+}

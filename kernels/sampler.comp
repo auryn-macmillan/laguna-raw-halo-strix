@@ -1,0 +1,53 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) suppress readonly buffer InLogits {
+    float logits[];
+};
+
+layout(binding = 1, std430) suppress writeonly buffer OutSample {
+    uint sample[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_logits;
+    uint seed;
+};
+
+uint hash(uint x) {
+    x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+    x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+    x = (x >> 16u) ^ x;
+    return x;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx > 0u) return;
+
+    float max_logit = logits[0];
+    for (uint i = 1u; i < n_logits; i++) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+        }
+    }
+
+    float sum_exp = 0.0;
+    for (uint i = 0u; i < n_logits; i++) {
+        sum_exp += exp(logits[i] - max_logit);
+    }
+
+    uint result = 0u;
+    float r = float(seed) / 4294967296.0;
+    float cumulative = 0.0;
+    for (uint i = 0u; i < n_logits; i++) {
+        cumulative += exp(logits[i] - max_logit) / sum_exp;
+        if (r < cumulative) {
+            result = i;
+            break;
+        }
+    }
+
+    sample[0] = result;
+}
