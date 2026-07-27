@@ -663,7 +663,7 @@ mod tests {
             data_offset: 0,
         };
         assert_eq!(t.n_elements(), 1024);
-        assert_eq!(t.n_bytes(), 1120);
+        assert_eq!(t.n_bytes(), 1088);
     }
 
     #[test]
@@ -675,8 +675,8 @@ mod tests {
             data_offset: 0,
         };
         assert_eq!(t.n_elements(), 7680);
-        assert_eq!(t.n_blocks(), 31);
-        assert_eq!(t.n_bytes(), 31 * 144);
+        assert_eq!(t.n_blocks(), 30);
+        assert_eq!(t.n_bytes(), 30 * 144);
     }
 
     #[test]

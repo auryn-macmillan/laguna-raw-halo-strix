@@ -25,7 +25,7 @@ void main() {
 
     float acc = 0.0;
     for (uint j = 0u; j < k; j++) {
-        acc += x[j] * w[j * n + i];
+        acc += x[j] * w[j + i * k];
     }
     c[i] = acc;
 }
