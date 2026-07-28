@@ -1,0 +1,66 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) readonly buffer InX {
+    float x[];
+};
+
+layout(binding = 1, std430) readonly buffer InW {
+    float w[];
+};
+
+layout(binding = 2, std430) readonly buffer InFreq {
+    float freq[];
+};
+
+layout(binding = 3, std430) writeonly buffer OutY {
+    float y[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_heads;
+    uint head_dim;
+    uint rope_dim;
+    float eps;
+};
+
+void main() {
+    uint total = n_heads * head_dim;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= total) return;
+
+    uint head = i / head_dim;
+    uint dim = i % head_dim;
+    uint base = head * head_dim;
+
+    // Per-head RMSNorm
+    float mean_sq = 0.0;
+    for (uint d = 0u; d < head_dim; d++) {
+        mean_sq += x[base + d] * x[base + d];
+    }
+    mean_sq /= float(head_dim);
+    float rms = inversesqrt(mean_sq + eps);
+
+    float normed = x[i] * w[dim] * rms;
+
+    // RoPE (GPT-NeoX style)
+    if (dim >= rope_dim) {
+        y[i] = normed;
+    } else {
+        uint hf = dim % (rope_dim / 2u);
+        float f = freq[hf];
+        float cos_f = cos(f);
+        float sin_f = sin(f);
+
+        if (dim < rope_dim / 2u) {
+            uint pair_idx = i + head_dim / 2u;
+            float pair_normed = x[pair_idx] * w[pair_idx % head_dim] * rms;
+            y[i] = normed * cos_f - pair_normed * sin_f;
+        } else {
+            uint pair_idx = i - head_dim / 2u;
+            float pair_normed = x[pair_idx] * w[pair_idx % head_dim] * rms;
+            y[i] = normed * cos_f + pair_normed * sin_f;
+        }
+    }
+}

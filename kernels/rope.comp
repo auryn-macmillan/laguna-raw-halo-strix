@@ -43,7 +43,9 @@ void main() {
         if (dim < rope_dim / 2u) {
             y[i] = x0 * cos_f - x1 * sin_f;
         } else {
-            y[i] = x0 * sin_f + x1 * cos_f;
+            uint pair_idx = i - head_dim / 2u;
+            float pair_x = x[pair_idx];
+            y[i] = x0 * cos_f + pair_x * sin_f;
         }
     }
 }

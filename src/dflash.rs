@@ -468,8 +468,7 @@ impl DFlashModel {
         let rmsnorm_shader = ctx.create_shader_module(crate::include_spv!(rmsnorm));
         let proj_shader = ctx.create_shader_module(crate::include_spv!(proj));
         let repeat_v_shader = ctx.create_shader_module(crate::include_spv!(repeat_v));
-        let qk_norm_shader = ctx.create_shader_module(crate::include_spv!(qk_norm));
-        let rope_shader = ctx.create_shader_module(crate::include_spv!(rope));
+        let qk_norm_rope_shader = ctx.create_shader_module(crate::include_spv!(qk_norm_rope));
         let activation_shader = ctx.create_shader_module(crate::include_spv!(activation));
         let gate_mul_shader = ctx.create_shader_module(crate::include_spv!(gate_mul));
         let add_shader = ctx.create_shader_module(crate::include_spv!(add));
@@ -542,48 +541,27 @@ impl DFlashModel {
                 n_kv_heads * head_dim_per_head,
             );
 
-            let push_ropec = [
-                n_heads as u32,
-                head_dim_per_head as u32,
-                1u32,
-                rope_dim as u32,
-            ];
-            dispatch_qk_norm(
+            dispatch_qk_norm_rope(
                 ctx,
-                &qk_norm_shader,
+                &qk_norm_rope_shader,
                 &bufs.q,
                 attn_q_norm_w,
-                &bufs.q_normed,
+                &freq_buf,
+                &bufs.q,
                 n_heads,
                 head_dim_per_head,
                 n_heads_x_hd,
             );
-            dispatch_qk_norm(
+            dispatch_qk_norm_rope(
                 ctx,
-                &qk_norm_shader,
+                &qk_norm_rope_shader,
                 &bufs.k,
                 attn_k_norm_w,
+                &freq_buf,
                 &bufs.k_normed,
                 n_kv_heads,
                 head_dim_per_head,
-                n_kv_heads * head_dim_per_head,
-            );
-
-            dispatch_rope(
-                ctx,
-                &rope_shader,
-                &bufs.q_normed,
-                &freq_buf,
-                &bufs.q,
-                &push_ropec,
-            );
-            dispatch_rope(
-                ctx,
-                &rope_shader,
-                &bufs.k_normed,
-                &freq_buf,
-                &bufs.k,
-                &push_ropec,
+                rope_dim,
             );
 
             let v_rep_out = GpuBuffer::new(
@@ -739,8 +717,7 @@ impl DFlashModel {
         let rmsnorm_shader = ctx.create_shader_module(crate::include_spv!(rmsnorm));
         let proj_shader = ctx.create_shader_module(crate::include_spv!(proj));
         let repeat_v_shader = ctx.create_shader_module(crate::include_spv!(repeat_v));
-        let qk_norm_shader = ctx.create_shader_module(crate::include_spv!(qk_norm));
-        let rope_shader = ctx.create_shader_module(crate::include_spv!(rope));
+        let qk_norm_rope_shader = ctx.create_shader_module(crate::include_spv!(qk_norm_rope));
         let activation_shader = ctx.create_shader_module(crate::include_spv!(activation));
         let gate_mul_shader = ctx.create_shader_module(crate::include_spv!(gate_mul));
         let add_shader = ctx.create_shader_module(crate::include_spv!(add));
@@ -784,12 +761,14 @@ impl DFlashModel {
             dispatch_proj(ctx, &proj_shader, &bufs.norm_x, attn_k_w, &bufs.k, n_embd, n_kv_heads * head_dim_per_head);
             dispatch_proj(ctx, &proj_shader, &bufs.norm_x, attn_v_w, &bufs.v, n_embd, n_kv_heads * head_dim_per_head);
 
-            let push_ropec = [n_heads as u32, head_dim_per_head as u32, 1u32, rope_dim as u32];
-            dispatch_qk_norm(ctx, &qk_norm_shader, &bufs.q, attn_q_norm_w, &bufs.q_normed, n_heads, head_dim_per_head, n_heads_x_hd);
-            dispatch_qk_norm(ctx, &qk_norm_shader, &bufs.k, attn_k_norm_w, &bufs.k_normed, n_kv_heads, head_dim_per_head, n_kv_heads * head_dim_per_head);
-
-            dispatch_rope(ctx, &rope_shader, &bufs.q_normed, &freq_buf, &bufs.q, &push_ropec);
-            dispatch_rope(ctx, &rope_shader, &bufs.k_normed, &freq_buf, &bufs.k, &push_ropec);
+            dispatch_qk_norm_rope(
+                ctx, &qk_norm_rope_shader, &bufs.q, attn_q_norm_w,
+                &freq_buf, &bufs.q_normed, n_heads, head_dim_per_head, rope_dim,
+            );
+            dispatch_qk_norm_rope(
+                ctx, &qk_norm_rope_shader, &bufs.k, attn_k_norm_w,
+                &freq_buf, &bufs.k_normed, n_kv_heads, head_dim_per_head, rope_dim,
+            );
 
             let v_rep_out = GpuBuffer::new(
                 ctx, (n_heads_x_hd * 4) as u64,
@@ -954,70 +933,40 @@ fn dispatch_proj_read(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_qk_norm(
+fn dispatch_qk_norm_rope(
     ctx: &VulkanContext,
     shader: &vk::ShaderModule,
-    q: &GpuBuffer,
+    x: &GpuBuffer,
     norm_w: &GpuBuffer,
+    freq: &GpuBuffer,
     out: &GpuBuffer,
     n_heads: usize,
     head_dim: usize,
-    n_total: usize,
+    rope_dim: usize,
 ) {
     let eps: f32 = 1e-6;
     let push: [u8; 16] = {
         let mut b = [0u8; 16];
         b[..4].copy_from_slice(&(n_heads as u32).to_le_bytes());
         b[4..8].copy_from_slice(&(head_dim as u32).to_le_bytes());
-        b[8..12].copy_from_slice(&(n_total as u32).to_le_bytes());
+        b[8..12].copy_from_slice(&(rope_dim as u32).to_le_bytes());
         b[12..].copy_from_slice(&eps.to_le_bytes());
         b
     };
 
-    let set_layout = ctx.create_descriptor_set_layout(3);
-    let pool = ctx.create_descriptor_pool(3);
-    let set = ctx.allocate_descriptor_set(pool, set_layout);
-
-    ctx.write_buffer_descriptor(set, 0, q.buffer, q.size);
-    ctx.write_buffer_descriptor(set, 1, norm_w.buffer, norm_w.size);
-    ctx.write_buffer_descriptor(set, 2, out.buffer, out.size);
-
-    let layout = ctx.create_pipeline_layout(set_layout, 16);
-    let pipeline = ctx.create_compute_pipeline(*shader, layout);
-    let groups = n_total.div_ceil(256) as u32;
-    ctx.submit_compute(pipeline, layout, set, &push, (groups, 1, 1));
-}
-
-fn dispatch_rope(
-    ctx: &VulkanContext,
-    shader: &vk::ShaderModule,
-    x: &GpuBuffer,
-    freq: &GpuBuffer,
-    out: &GpuBuffer,
-    push: &[u32; 4],
-) {
-    let push_bytes: [u8; 16] = {
-        let mut b = [0u8; 16];
-        b[..4].copy_from_slice(&push[0].to_le_bytes());
-        b[4..8].copy_from_slice(&push[1].to_le_bytes());
-        b[8..12].copy_from_slice(&push[2].to_le_bytes());
-        b[12..].copy_from_slice(&push[3].to_le_bytes());
-        b
-    };
-
-    let set_layout = ctx.create_descriptor_set_layout(3);
-    let pool = ctx.create_descriptor_pool(3);
+    let set_layout = ctx.create_descriptor_set_layout(4);
+    let pool = ctx.create_descriptor_pool(4);
     let set = ctx.allocate_descriptor_set(pool, set_layout);
 
     ctx.write_buffer_descriptor(set, 0, x.buffer, x.size);
-    ctx.write_buffer_descriptor(set, 1, freq.buffer, freq.size);
-    ctx.write_buffer_descriptor(set, 2, out.buffer, out.size);
+    ctx.write_buffer_descriptor(set, 1, norm_w.buffer, norm_w.size);
+    ctx.write_buffer_descriptor(set, 2, freq.buffer, freq.size);
+    ctx.write_buffer_descriptor(set, 3, out.buffer, out.size);
 
     let layout = ctx.create_pipeline_layout(set_layout, 16);
     let pipeline = ctx.create_compute_pipeline(*shader, layout);
-    let total: u32 = push[0] * push[1] * push[2];
-    let groups = total.div_ceil(256);
-    ctx.submit_compute(pipeline, layout, set, &push_bytes, (groups, 1, 1));
+    let groups = (n_heads * head_dim).div_ceil(256) as u32;
+    ctx.submit_compute(pipeline, layout, set, &push, (groups, 1, 1));
 }
 
 fn dispatch_repeat_v(

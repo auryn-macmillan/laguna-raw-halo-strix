@@ -19,6 +19,7 @@ fn main() {
 
     let shaders = [
         "enc_aux_norm.comp",
+        "qk_norm_rope.comp",
         "dequant.comp",
         "dequant_bf16.comp",
         "dequant_q4k.comp",
