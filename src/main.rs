@@ -15,8 +15,8 @@ fn main() {
         eprintln!("  test-rmsnorm              - test rmsnorm on GPU");
         eprintln!("  test-rope                 - test rope on GPU");
         eprintln!("  target-forward <gguf> <tok> - run target model forward pass");
-        eprintln!("  target-info <gguf>        - show target model info");
-        std::process::exit(1);
+        eprintln!("  target-generate <gguf> <start> <n> - cached autoregressive generation");
+        eprintln!("  target-info <gguf>        - show target model info");        std::process::exit(1);
     }
 
     let command = &args[1];
@@ -65,6 +65,12 @@ fn main() {
         "target-info" => {
             let path = Path::new(&args[2]);
             laguna_raw::run_target_info(path);
+        }
+        "target-generate" => {
+            let path = Path::new(&args[2]);
+            let start: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let n: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(16);
+            laguna_raw::run_target_generate(path, start, n);
         }
         "target-dflash" => {
             let target = Path::new(&args[2]);

@@ -36,17 +36,17 @@ void main() {
 
     uint kv_h = h * n_kv_heads / n_q_heads;
 
-    float max_score = -1e30;
-    float scores[64];
     uint n = seq_len;
-    if (n > 64u) n = 64u;
-
     uint q_base = h * head_dim;
+
+    // Online (streaming) softmax attention: single pass, no bounded scores array.
+    float m = -1e30;   // running max score
+    float l = 0.0;     // running sum of exp(score - m)
+    float acc = 0.0;   // running weighted value accumulation
 
     for (uint p = 0u; p < n; p++) {
         if (causal != 0u && p > q_pos) {
-            scores[p] = -1e30;
-            continue;
+            break;
         }
 
         uint k_base = p * n_kv_heads * head_dim + kv_h * head_dim;
@@ -54,22 +54,19 @@ void main() {
         for (uint j = 0u; j < head_dim; j++) {
             dot += Q[q_base + j] * K[k_base + j];
         }
-        scores[p] = dot * scale;
+        float score = dot * scale;
 
-        if (scores[p] > max_score) max_score = scores[p];
-    }
+        float m_new = max(m, score);
+        float correction = exp(m - m_new);
+        float w = exp(score - m_new);
 
-    float sum_exp = 0.0;
-    for (uint p = 0u; p < n; p++) {
-        sum_exp += exp(scores[p] - max_score);
-    }
+        l = l * correction + w;
 
-    float result = 0.0;
-    for (uint p = 0u; p < n; p++) {
-        float weight = exp(scores[p] - max_score) / sum_exp;
         uint v_base = p * n_kv_heads * head_dim + kv_h * head_dim;
-        result += weight * V[v_base + dim];
+        acc = acc * correction + w * V[v_base + dim];
+
+        m = m_new;
     }
 
-    out_attn[d] = result;
+    out_attn[d] = (l > 0.0) ? (acc / l) : 0.0;
 }

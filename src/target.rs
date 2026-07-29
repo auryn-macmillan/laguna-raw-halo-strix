@@ -69,6 +69,37 @@ pub struct TargetLayer {
     pub n_q_heads: usize,
 }
 
+/// Per-layer autoregressive K/V cache for the target model.
+/// K/V are stored post-normalization/RoPE, flat as [pos * n_kv_heads * head_dim + ...].
+pub struct TargetKvCache {
+    /// One entry per transformer layer; each is the flattened cached K sequence.
+    pub k: Vec<Vec<f32>>,
+    /// One entry per transformer layer; each is the flattened cached V sequence.
+    pub v: Vec<Vec<f32>>,
+    /// Number of tokens currently cached.
+    pub len: usize,
+}
+
+impl TargetKvCache {
+    pub fn new(n_layers: usize) -> Self {
+        TargetKvCache {
+            k: vec![Vec::new(); n_layers],
+            v: vec![Vec::new(); n_layers],
+            len: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for k in &mut self.k {
+            k.clear();
+        }
+        for v in &mut self.v {
+            v.clear();
+        }
+        self.len = 0;
+    }
+}
+
 #[allow(dead_code)]
 pub struct TargetModel {
     pub model: Model,
@@ -265,7 +296,29 @@ impl TargetModel {
     }
 
     pub fn forward_token(&self, input: &[f32], layer_indices: Option<&[usize]>) -> (Vec<f32>, Vec<Vec<f32>>) {
+        self.forward_token_impl(input, layer_indices, None)
+    }
+
+    /// Cache-aware autoregressive forward. Appends this token's K/V to `cache`
+    /// and attends over the full cached sequence. `cache.len` is used as the
+    /// RoPE/attention position for this token, then incremented.
+    pub fn forward_token_cached(
+        &self,
+        input: &[f32],
+        layer_indices: Option<&[usize]>,
+        cache: &mut TargetKvCache,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        self.forward_token_impl(input, layer_indices, Some(cache))
+    }
+
+    fn forward_token_impl(
+        &self,
+        input: &[f32],
+        layer_indices: Option<&[usize]>,
+        mut cache: Option<&mut TargetKvCache>,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let ctx = &self.ctx;
+        let cache_pos = cache.as_ref().map(|c| c.len).unwrap_or(0);
         let n_embd = self.embedding_length();
         let n_heads = self.model.head_count;
         let n_kv_heads = self.model.head_count_kv;
@@ -390,21 +443,21 @@ impl TargetModel {
                 dispatch_qk_norm_rope_swa(
                     ctx, &qk_norm_rope_swa_shader, &q_buf, &attn_q_norm_w.buf,
                     freq_swa_buf.as_ref().unwrap(), &q_normed_buf,
-                    n_q_heads, head_dim, rope_dim_swa, 0,
+                    n_q_heads, head_dim, rope_dim_swa, cache_pos as u32,
                 );
                 dispatch_qk_norm_rope_swa(
                     ctx, &qk_norm_rope_swa_shader, &k_buf, &attn_k_norm_w.buf,
                     freq_swa_buf.as_ref().unwrap(), &k_normed_buf,
-                    n_kv_heads, head_dim, rope_dim_swa, 0,
+                    n_kv_heads, head_dim, rope_dim_swa, cache_pos as u32,
                 );
             } else {
                 dispatch_qk_norm_rope(
                     ctx, &qk_norm_rope_shader, &q_buf, &attn_q_norm_w.buf,
-                    &freq_buf, &q_normed_buf, n_q_heads, head_dim, rope_dim, 0,
+                    &freq_buf, &q_normed_buf, n_q_heads, head_dim, rope_dim, cache_pos as u32,
                 );
                 dispatch_qk_norm_rope(
                     ctx, &qk_norm_rope_shader, &k_buf, &attn_k_norm_w.buf,
-                    &freq_buf, &k_normed_buf, n_kv_heads, head_dim, rope_dim, 0,
+                    &freq_buf, &k_normed_buf, n_kv_heads, head_dim, rope_dim, cache_pos as u32,
                 );
             }
 
@@ -412,10 +465,34 @@ impl TargetModel {
                 ctx, (n_heads_x_hd * 4) as u64, flags, mem_flags,
             );
 
-            dispatch_mha_attn(
-                ctx, &mha_attn_shader, &q_normed_buf, &k_normed_buf, &v_buf,
-                &attn_out_buf, n_q_heads, n_kv_heads, head_dim,
-            );
+            if let Some(cache) = cache.as_deref_mut() {
+                // Append this token's normalized K and raw V to the per-layer cache,
+                // then attend over the full cached sequence.
+                let kv_stride = n_kv_heads * head_dim;
+                let k_tok = k_normed_buf.read_f32(kv_stride);
+                let v_tok = v_buf.read_f32(kv_stride);
+                cache.k[layer_idx].extend_from_slice(&k_tok);
+                cache.v[layer_idx].extend_from_slice(&v_tok);
+
+                let seq_len = cache.k[layer_idx].len() / kv_stride;
+
+                let k_seq_buf = GpuBuffer::new(ctx, (cache.k[layer_idx].len() * 4) as u64, flags, mem_flags);
+                let v_seq_buf = GpuBuffer::new(ctx, (cache.v[layer_idx].len() * 4) as u64, flags, mem_flags);
+                let k_bytes: Vec<u8> = cache.k[layer_idx].iter().flat_map(|v| v.to_le_bytes()).collect();
+                let v_bytes: Vec<u8> = cache.v[layer_idx].iter().flat_map(|v| v.to_le_bytes()).collect();
+                k_seq_buf.upload(&k_bytes);
+                v_seq_buf.upload(&v_bytes);
+
+                dispatch_mha_attn_seq(
+                    ctx, &mha_attn_shader, &q_normed_buf, &k_seq_buf, &v_seq_buf,
+                    &attn_out_buf, n_q_heads, n_kv_heads, head_dim, seq_len, seq_len - 1,
+                );
+            } else {
+                dispatch_mha_attn(
+                    ctx, &mha_attn_shader, &q_normed_buf, &k_normed_buf, &v_buf,
+                    &attn_out_buf, n_q_heads, n_kv_heads, head_dim,
+                );
+            }
 
             if let Some(attn_gate_w) = &layer.dense.attn_gate_w {
                 let gate_buf = GpuBuffer::new(ctx, (n_q_heads * 4) as u64, flags, mem_flags);
@@ -472,6 +549,10 @@ impl TargetModel {
 
         if capture_set.contains(&self.layers.len()) {
             captured_states.push(x_buf.read_f32(n_embd));
+        }
+
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.len += 1;
         }
 
         if let Some(output_norm_w) = &self.output_norm_w {

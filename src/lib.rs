@@ -332,6 +332,54 @@ pub fn run_target_forward(path: &Path, token_id: usize) {
     }
 }
 
+/// Cached autoregressive greedy generation using the target model's KV cache.
+pub fn run_target_generate(path: &Path, start_token: usize, n_tokens: usize) {
+    use target::{TargetModel, TargetKvCache};
+    use dflash::dequant_to_f32;
+    use gguf::TensorType;
+
+    let mut model = TargetModel::load(path).expect("failed to load target model");
+    let n_embd = model.embedding_length();
+    let vocab_size = model.vocab_size();
+    let n_layers = model.layers.len();
+
+    if model.tok_embeddings.is_none() {
+        eprintln!("model has no token embeddings; cannot generate");
+        std::process::exit(1);
+    }
+    let n_elements = model.tok_embeddings.as_ref().unwrap().n_elements;
+    let raw = model.read_tensor_raw("token_embd.weight").expect("read tok_embd");
+    let gt = model.model.reader.tensor_by_name("token_embd.weight")
+        .map(|t| t.dtype).unwrap_or(TensorType::F32);
+    let all_embs = dequant_to_f32(&raw, gt, n_elements);
+
+    let embed = |tok: usize| -> Vec<f32> {
+        (0..n_embd).map(|i| all_embs[tok * n_embd + i]).collect()
+    };
+
+    let mut cache = TargetKvCache::new(n_layers);
+    let mut cur = start_token;
+    let mut generated = Vec::new();
+
+    println!("Generating {} tokens from start_token={}", n_tokens, start_token);
+    for step in 0..n_tokens {
+        if cur >= vocab_size {
+            eprintln!("token {} out of range", cur);
+            break;
+        }
+        let emb = embed(cur);
+        let (logits, _) = model.forward_token_cached(&emb, None, &mut cache);
+        let next = logits.iter().copied().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        println!("  step {}: input={} -> next={}", step, cur, next);
+        generated.push(next);
+        cur = next;
+    }
+    println!("Generated tokens: {:?}", generated);
+}
+
 pub fn run_target_dflash(target_path: &Path, dflash_path: &Path, token_id: usize) {
     use dflash::{dequant_to_f32, DFlashModel};
     use gguf::TensorType;
