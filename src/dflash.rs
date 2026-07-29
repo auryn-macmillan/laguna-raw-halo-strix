@@ -311,6 +311,23 @@ fn f32_to_bytes(data: &[f32]) -> Vec<u8> {
     data.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+pub fn bf16_to_f32(h_bits: u16) -> f32 {
+    let sign = (h_bits as u32 & 0x8000) << 16;
+    let exp = ((h_bits as u32) >> 10) & 0x1F;
+    let mant = (h_bits as u32 & 0x3FF) << 13;
+    if exp == 0 {
+        if mant == 0 {
+            f32::from_bits(sign)
+        } else {
+            f32::from_bits(sign | (113u32 << 23) | mant)
+        }
+    } else if exp == 31 {
+        f32::from_bits(sign | 0x7F800000 | mant)
+    } else {
+        f32::from_bits(sign | ((exp + 112) << 23) | mant)
+    }
+}
+
 pub fn dequant_to_f32(data: &[u8], dtype: TensorType, n_elements: usize) -> Vec<f32> {
     match dtype {
         TensorType::F32 => {
@@ -337,7 +354,22 @@ pub fn dequant_to_f32(data: &[u8], dtype: TensorType, n_elements: usize) -> Vec<
                 let offset = i * 2;
                 if offset + 2 <= data.len() {
                     let h_bits = u16::from_le_bytes([data[offset], data[offset + 1]]);
-                    result.push(f32::from_bits((h_bits as u32) << 16));
+                    let sign = (h_bits as u32 & 0x8000) << 16;
+                    let exp = ((h_bits as u32 >> 10) & 0x1F) as i32;
+                    let mant = (h_bits as u32 & 0x3FF) << 13;
+                    if exp == 0 {
+                        let f32_bits = if mant == 0 {
+                            sign
+                        } else {
+                            sign | (1u32.wrapping_sub(15).wrapping_add(127) << 23) | mant
+                        };
+                        result.push(f32::from_bits(f32_bits));
+                    } else if exp == 31 {
+                        result.push(f32::from_bits(sign | 0x7F800000 | mant));
+                    } else {
+                        let f_exp = ((exp as u32).wrapping_add(112)) << 23;
+                        result.push(f32::from_bits(sign | f_exp | mant));
+                    }
                 } else {
                     result.push(0.0);
                 }
@@ -353,11 +385,7 @@ pub fn dequant_to_f32(data: &[u8], dtype: TensorType, n_elements: usize) -> Vec<
                     break;
                 }
                 let h_bits = u16::from_le_bytes([data[offset], data[offset + 1]]);
-                let d = if h_bits == 0 {
-                    0.0
-                } else {
-                    f32::from_bits((h_bits as u32) << 16)
-                };
+                let d = bf16_to_f32(h_bits);
                 let start = block_idx * 32;
                 let end = (start + 32).min(n_elements);
                 for i in 0..(end - start) {
@@ -551,6 +579,7 @@ impl DFlashModel {
                 n_heads,
                 head_dim_per_head,
                 n_heads_x_hd,
+                0,
             );
             dispatch_qk_norm_rope(
                 ctx,
@@ -562,6 +591,7 @@ impl DFlashModel {
                 n_kv_heads,
                 head_dim_per_head,
                 rope_dim,
+                0,
             );
 
             let v_rep_out = GpuBuffer::new(
@@ -763,11 +793,11 @@ impl DFlashModel {
 
             dispatch_qk_norm_rope(
                 ctx, &qk_norm_rope_shader, &bufs.q, attn_q_norm_w,
-                &freq_buf, &bufs.q_normed, n_heads, head_dim_per_head, rope_dim,
+                &freq_buf, &bufs.q_normed, n_heads, head_dim_per_head, rope_dim, 0,
             );
             dispatch_qk_norm_rope(
                 ctx, &qk_norm_rope_shader, &bufs.k, attn_k_norm_w,
-                &freq_buf, &bufs.k_normed, n_kv_heads, head_dim_per_head, rope_dim,
+                &freq_buf, &bufs.k_normed, n_kv_heads, head_dim_per_head, rope_dim, 0,
             );
 
             let v_rep_out = GpuBuffer::new(
@@ -831,6 +861,119 @@ impl DFlashModel {
 
         self.forward_from_input(&bufs, &enc_output)
     }
+
+    pub fn forward_encode_and_decode_hidden(&self, target_features: &[f32]) -> Vec<f32> {
+        let n_embd = self.embedding_length();
+        let bufs = ForwardBuffers::new(
+            &self.ctx, n_embd, self.head_count(), self.head_count_kv(),
+            self.head_dim(), self.ffn_length(),
+        );
+
+        let enc_output = self.encode(target_features);
+        let _ = self.forward_from_input(&bufs, &enc_output);
+        bufs.x.read_f32(n_embd)
+    }
+
+    pub fn forward_injected_decode_hidden(&self, target_features: &[f32], token_input: &[f32]) -> Vec<f32> {
+        let n_embd = self.embedding_length();
+        let n_heads = self.head_count();
+        let n_kv_heads = self.head_count_kv();
+        let head_dim = self.head_dim();
+        let n_ff = self.ffn_length();
+        let rope_dim = self.rope_dim();
+        let n_heads_x_hd = n_heads * head_dim;
+        let n_kv_x_hd = n_kv_heads * head_dim;
+
+        let ctx = &self.ctx;
+        let enc_output = self.encode(target_features);
+
+        let bufs = ForwardBuffers::new(ctx, n_embd, n_heads, n_kv_heads, head_dim, n_ff);
+        bufs.x.upload(&f32_to_bytes(token_input));
+
+        let rmsnorm_shader = ctx.create_shader_module(crate::include_spv!(rmsnorm));
+        let proj_shader = ctx.create_shader_module(crate::include_spv!(proj));
+        let qk_norm_rope_shader = ctx.create_shader_module(crate::include_spv!(qk_norm_rope));
+        let mha_attn_shader = ctx.create_shader_module(crate::include_spv!(mha_attn));
+        let activation_shader = ctx.create_shader_module(crate::include_spv!(activation));
+        let gate_mul_shader = ctx.create_shader_module(crate::include_spv!(gate_mul));
+        let add_shader = ctx.create_shader_module(crate::include_spv!(add));
+
+        let freq: Vec<f32> = (0..rope_dim / 2)
+            .map(|i| {
+                let base = self.model.reader.metadata.rope_freq_base.unwrap_or(500000.0);
+                1.0 / base.powf((2.0 * i as f32) / rope_dim as f32)
+            })
+            .collect();
+        let freq_buf = upload_f32(ctx, &freq);
+
+        let flags = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let mem_flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+
+        let enc_buf = upload_f32(ctx, &enc_output);
+        let enc_norm = GpuBuffer::new(ctx, (n_embd * 4) as u64, flags, mem_flags);
+        let k_inj = GpuBuffer::new(ctx, (n_kv_x_hd * 4) as u64, flags, mem_flags);
+        let v_inj = GpuBuffer::new(ctx, (n_kv_x_hd * 4) as u64, flags, mem_flags);
+        let k_inj_normed = GpuBuffer::new(ctx, (n_kv_x_hd * 4) as u64, flags, mem_flags);
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            let attn_norm_w = layer.attn_norm_w.as_ref().expect("attn_norm_w");
+            let attn_q_w = layer.attn_q_w.as_ref().expect("attn_q_w");
+            let attn_k_w = layer.attn_k_w.as_ref().expect("attn_k_w");
+            let attn_v_w = layer.attn_v_w.as_ref().expect("attn_v_w");
+            let attn_output_w = layer.attn_output_w.as_ref().expect("attn_output_w");
+            let attn_q_norm_w = layer.attn_q_norm_w.as_ref().expect("attn_q_norm_w");
+            let attn_k_norm_w = layer.attn_k_norm_w.as_ref().expect("attn_k_norm_w");
+            let attn_gate_w = layer.attn_gate_w.as_ref().expect("attn_gate_w");
+            let ffn_norm_w = layer.ffn_norm_w.as_ref().expect("ffn_norm_w");
+            let ffn_gate_w = layer.ffn_gate_w.as_ref().expect("ffn_gate_w");
+            let ffn_up_w = layer.ffn_up_w.as_ref().expect("ffn_up_w");
+            let ffn_down_w = layer.ffn_down_w.as_ref().expect("ffn_down_w");
+
+            dispatch_rmsnorm(ctx, &rmsnorm_shader, attn_norm_w, &enc_buf, &enc_norm, n_embd);
+            dispatch_proj(ctx, &proj_shader, &enc_norm, attn_k_w, &k_inj, n_embd, n_kv_x_hd);
+            dispatch_proj(ctx, &proj_shader, &enc_norm, attn_v_w, &v_inj, n_embd, n_kv_x_hd);
+            dispatch_qk_norm_rope(ctx, &qk_norm_rope_shader, &k_inj, attn_k_norm_w, &freq_buf, &k_inj_normed, n_kv_heads, head_dim, rope_dim, 0);
+
+            dispatch_rmsnorm(ctx, &rmsnorm_shader, attn_norm_w, &bufs.x, &bufs.norm_x, n_embd);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, attn_q_w, &bufs.q, n_embd, n_heads_x_hd);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, attn_k_w, &bufs.k, n_embd, n_kv_x_hd);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, attn_v_w, &bufs.v, n_embd, n_kv_x_hd);
+            dispatch_qk_norm_rope(ctx, &qk_norm_rope_shader, &bufs.q, attn_q_norm_w, &freq_buf, &bufs.q_normed, n_heads, head_dim, rope_dim, 1);
+            dispatch_qk_norm_rope(ctx, &qk_norm_rope_shader, &bufs.k, attn_k_norm_w, &freq_buf, &bufs.k_normed, n_kv_heads, head_dim, rope_dim, 1);
+
+            let mut k_seq = Vec::with_capacity(2 * n_kv_x_hd);
+            k_seq.extend_from_slice(&k_inj_normed.read_f32(n_kv_x_hd));
+            k_seq.extend_from_slice(&bufs.k_normed.read_f32(n_kv_x_hd));
+            let mut v_seq = Vec::with_capacity(2 * n_kv_x_hd);
+            v_seq.extend_from_slice(&v_inj.read_f32(n_kv_x_hd));
+            v_seq.extend_from_slice(&bufs.v.read_f32(n_kv_x_hd));
+            let k_seq_buf = upload_f32(ctx, &k_seq);
+            let v_seq_buf = upload_f32(ctx, &v_seq);
+
+            dispatch_mha_attn_seq(ctx, &mha_attn_shader, &bufs.q_normed, &k_seq_buf, &v_seq_buf, &bufs.attn_out, n_heads, n_kv_heads, head_dim, 2, 1);
+
+            let gate_data = dispatch_proj_read(ctx, &proj_shader, &bufs.norm_x, attn_gate_w, n_embd, n_heads);
+            let gate_f32: Vec<f32> = gate_data.iter().map(|&g| if g > 20.0 { g } else { (1.0 + g.exp()).ln() }).collect();
+            let gate_buf = upload_f32(ctx, &gate_f32);
+            dispatch_gate_mul(ctx, &gate_mul_shader, &bufs.attn_out, &bufs.attn_out, &gate_buf, n_heads_x_hd, n_heads, head_dim);
+
+            dispatch_proj(ctx, &proj_shader, &bufs.attn_out, attn_output_w, &bufs.ffn_out, n_heads_x_hd, n_embd);
+            dispatch_add(ctx, &add_shader, &bufs.x, &bufs.ffn_out, &bufs.x, n_embd);
+
+            dispatch_rmsnorm(ctx, &rmsnorm_shader, ffn_norm_w, &bufs.x, &bufs.norm_x, n_embd);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, ffn_gate_w, &bufs.ffn_gate, n_embd, n_ff);
+            dispatch_proj(ctx, &proj_shader, &bufs.norm_x, ffn_up_w, &bufs.ffn_up, n_embd, n_ff);
+            dispatch_activation(ctx, &activation_shader, &bufs.ffn_gate, &bufs.ffn_up, &bufs.ffn_h, n_ff);
+            dispatch_proj(ctx, &proj_shader, &bufs.ffn_h, ffn_down_w, &bufs.ffn_out, n_ff, n_embd);
+            dispatch_add(ctx, &add_shader, &bufs.x, &bufs.ffn_out, &bufs.x, n_embd);
+        }
+
+        if let Some(output_norm_w) = &self.output_norm_w {
+            dispatch_rmsnorm(ctx, &rmsnorm_shader, output_norm_w, &bufs.x, &bufs.x, n_embd);
+        }
+        bufs.x.read_f32(n_embd)
+    }
 }
 
 fn dispatch_rmsnorm(
@@ -872,10 +1015,24 @@ fn dispatch_proj(
     k: usize,
     n: usize,
 ) {
-    let push: [u8; 8] = {
-        let mut b = [0u8; 8];
+    dispatch_proj_row(ctx, shader, x, w, c, k, n, 0);
+}
+
+fn dispatch_proj_row(
+    ctx: &VulkanContext,
+    shader: &vk::ShaderModule,
+    x: &GpuBuffer,
+    w: &GpuBuffer,
+    c: &GpuBuffer,
+    k: usize,
+    n: usize,
+    row_major: u32,
+) {
+    let push: [u8; 12] = {
+        let mut b = [0u8; 12];
         b[..4].copy_from_slice(&(k as u32).to_le_bytes());
-        b[4..].copy_from_slice(&(n as u32).to_le_bytes());
+        b[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        b[8..12].copy_from_slice(&row_major.to_le_bytes());
         b
     };
 
@@ -887,7 +1044,7 @@ fn dispatch_proj(
     ctx.write_buffer_descriptor(set, 1, w.buffer, w.size);
     ctx.write_buffer_descriptor(set, 2, c.buffer, c.size);
 
-    let layout = ctx.create_pipeline_layout(set_layout, 8);
+    let layout = ctx.create_pipeline_layout(set_layout, 12);
     let pipeline = ctx.create_compute_pipeline(*shader, layout);
     let groups = n.div_ceil(256) as u32;
     ctx.submit_compute(pipeline, layout, set, &push, (groups, 1, 1));
@@ -943,14 +1100,16 @@ fn dispatch_qk_norm_rope(
     n_heads: usize,
     head_dim: usize,
     rope_dim: usize,
+    pos: u32,
 ) {
     let eps: f32 = 1e-6;
-    let push: [u8; 16] = {
-        let mut b = [0u8; 16];
+    let push: [u8; 20] = {
+        let mut b = [0u8; 20];
         b[..4].copy_from_slice(&(n_heads as u32).to_le_bytes());
         b[4..8].copy_from_slice(&(head_dim as u32).to_le_bytes());
         b[8..12].copy_from_slice(&(rope_dim as u32).to_le_bytes());
-        b[12..].copy_from_slice(&eps.to_le_bytes());
+        b[12..16].copy_from_slice(&eps.to_le_bytes());
+        b[16..20].copy_from_slice(&pos.to_le_bytes());
         b
     };
 
@@ -963,7 +1122,7 @@ fn dispatch_qk_norm_rope(
     ctx.write_buffer_descriptor(set, 2, freq.buffer, freq.size);
     ctx.write_buffer_descriptor(set, 3, out.buffer, out.size);
 
-    let layout = ctx.create_pipeline_layout(set_layout, 16);
+    let layout = ctx.create_pipeline_layout(set_layout, 20);
     let pipeline = ctx.create_compute_pipeline(*shader, layout);
     let groups = (n_heads * head_dim).div_ceil(256) as u32;
     ctx.submit_compute(pipeline, layout, set, &push, (groups, 1, 1));
@@ -994,6 +1153,47 @@ fn dispatch_repeat_v(
     let layout = ctx.create_pipeline_layout(set_layout, 8);
     let pipeline = ctx.create_compute_pipeline(*shader, layout);
     let groups = n_out.div_ceil(256) as u32;
+    ctx.submit_compute(pipeline, layout, set, &push, (groups, 1, 1));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_mha_attn_seq(
+    ctx: &VulkanContext,
+    shader: &vk::ShaderModule,
+    q_normed: &GpuBuffer,
+    k_seq: &GpuBuffer,
+    v_seq: &GpuBuffer,
+    out: &GpuBuffer,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    q_pos: usize,
+) {
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let push: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&(n_q_heads as u32).to_le_bytes());
+        b[4..8].copy_from_slice(&(n_kv_heads as u32).to_le_bytes());
+        b[8..12].copy_from_slice(&(head_dim as u32).to_le_bytes());
+        b[12..16].copy_from_slice(&(seq_len as u32).to_le_bytes());
+        b[16..20].copy_from_slice(&scale.to_le_bytes());
+        b[20..24].copy_from_slice(&(q_pos as u32).to_le_bytes());
+        b[24..28].copy_from_slice(&1u32.to_le_bytes());
+        b
+    };
+
+    let set_layout = ctx.create_descriptor_set_layout(4);
+    let pool = ctx.create_descriptor_pool(4);
+    let set = ctx.allocate_descriptor_set(pool, set_layout);
+    ctx.write_buffer_descriptor(set, 0, q_normed.buffer, q_normed.size);
+    ctx.write_buffer_descriptor(set, 1, k_seq.buffer, k_seq.size);
+    ctx.write_buffer_descriptor(set, 2, v_seq.buffer, v_seq.size);
+    ctx.write_buffer_descriptor(set, 3, out.buffer, out.size);
+
+    let layout = ctx.create_pipeline_layout(set_layout, 32);
+    let pipeline = ctx.create_compute_pipeline(*shader, layout);
+    let groups = (n_q_heads * head_dim).div_ceil(256) as u32;
     ctx.submit_compute(pipeline, layout, set, &push, (groups, 1, 1));
 }
 
@@ -1132,30 +1332,27 @@ mod tests {
 
     #[test]
     fn test_dequant_bf16() {
-        let data: Vec<u8> = (0..64)
-            .flat_map(|i| {
-                let v = (i as f32 - 32.0) * 0.001;
-                let bits = (v.to_bits() >> 16) as u16;
-                bits.to_le_bytes().to_vec()
-            })
-            .collect();
-        let result = dequant_to_f32(&data, TensorType::BF16, 64);
-        for i in 0..64 {
-            let expected = (i as f32 - 32.0) * 0.001;
-            assert!((result[i] - expected).abs() < 1e-3);
-        }
+        let h: u16 = 0x3C00;
+        let data = h.to_le_bytes().to_vec();
+        let result = dequant_to_f32(&data, TensorType::BF16, 1);
+        assert!((result[0] - 1.0).abs() < 1e-6);
+
+        let h2: u16 = 0x3E00;
+        let data2 = h2.to_le_bytes().to_vec();
+        let result2 = dequant_to_f32(&data2, TensorType::BF16, 1);
+        assert!((result2[0] - 1.5).abs() < 1e-6);
     }
 
     #[test]
     fn test_dequant_q8_0() {
         let mut data = vec![0u8; 34];
-        let h_bits = (0.5f32.to_bits() >> 16) as u16;
-        data[0..2].copy_from_slice(&h_bits.to_le_bytes());
+        let h: u16 = 0x3C00;
+        data[0..2].copy_from_slice(&h.to_le_bytes());
         for i in 0..32 {
             data[2 + i] = 1;
         }
         let result = dequant_to_f32(&data, TensorType::Q8_0, 32);
-        assert!((result[0] - 0.5).abs() < 1e-3);
+        assert!((result[0] - 1.0).abs() < 1e-3);
     }
 
     #[test]

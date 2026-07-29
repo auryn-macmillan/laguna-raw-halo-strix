@@ -17,6 +17,7 @@ layout(binding = 2, std430) writeonly buffer OutC {
 layout(push_constant) uniform Push {
     uint k;
     uint n;
+    uint row_major;
 };
 
 void main() {
@@ -25,7 +26,8 @@ void main() {
 
     float acc = 0.0;
     for (uint j = 0u; j < k; j++) {
-        acc += x[j] * w[j + i * k];
+        uint idx = (row_major != 0u) ? (j * n + i) : (j + i * k);
+        acc += x[j] * w[idx];
     }
     c[i] = acc;
 }

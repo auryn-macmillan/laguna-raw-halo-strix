@@ -1,0 +1,67 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) readonly buffer InX {
+    float x[];
+};
+
+layout(binding = 1, std430) readonly buffer InW {
+    uint w_data[];
+};
+
+layout(binding = 2, std430) writeonly buffer OutC {
+    float c[];
+};
+
+layout(push_constant) uniform Push {
+    uint k;
+    uint n;
+};
+
+uint read_byte(uint offset) {
+    uint word = w_data[offset / 4u];
+    return (word >> ((offset % 4u) * 8u)) & 0xFFu;
+}
+
+float half_to_f32(uint h_bits) {
+    uint sign = h_bits & 0x8000u;
+    uint exp = (h_bits >> 10u) & 0x1Fu;
+    uint mant = h_bits & 0x3FFu;
+
+    if (exp == 0u) {
+        if (mant == 0u) return uintBitsToFloat(sign << 16u);
+        uint f_exp = (1u - 15u + 127u) << 23u;
+        return uintBitsToFloat((sign << 16u) | f_exp | (mant << 13u));
+    }
+    if (exp == 31u) {
+        if (mant == 0u) return uintBitsToFloat((sign << 16u) | 0x7F800000u);
+        return uintBitsToFloat((sign << 16u) | 0x7F800000u | (mant << 13u));
+    }
+
+    uint f_exp = ((exp - 15u + 127u) << 23u);
+    uint f_bits = (sign << 16u) | f_exp | (mant << 13u);
+    return uintBitsToFloat(f_bits);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+
+    float acc = 0.0;
+
+    for (uint j = 0u; j < k; j++) {
+        uint lin = i * k + j;
+        uint blk = lin / 32u;
+        uint elm = lin % 32u;
+        uint blk_off = blk * 34u;
+
+        uint d_bits = read_byte(blk_off) | (read_byte(blk_off + 1u) << 8u);
+        float d = half_to_f32(d_bits);
+        int q_val = int(read_byte(blk_off + 2u + elm));
+        int q = (q_val < 128) ? q_val : (q_val - 256);
+        acc += x[j] * (float(q) * d);
+    }
+
+    c[i] = acc;
+}

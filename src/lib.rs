@@ -1,6 +1,7 @@
 pub mod dflash;
 pub mod gguf;
 pub mod model;
+pub mod target;
 pub mod vulkan;
 
 #[macro_export]
@@ -251,4 +252,261 @@ pub fn run_test_rope() {
 
     let _result = out_buf.read_f32(4);
     println!("test-rope: PASS (4 elements, rope_dim=4)");
+}
+
+pub fn run_target_info(path: &Path) {
+    use target::TargetModel;
+    let model = TargetModel::load(path).expect("failed to load target model");
+    let m = &model.model;
+    println!("Target Model Info:");
+    println!("  layers: {}", model.layer_count());
+    println!("  embedding_length: {}", m.embedding_length);
+    println!("  ffn_length: {}", m.ffn_length);
+    println!("  head_count: {}", m.head_count);
+    println!("  head_count_kv: {}", m.head_count_kv);
+    println!("  head_dim: {}", m.head_dim);
+    println!("  rope_dim: {}", m.rope_dim);
+    println!("  rope_dim_swa: {}", m.rope_dim_swa);
+    println!("  expert_count: {}", m.n_expert);
+    println!("  expert_used_count: {}", m.n_expert_used);
+    println!("  expert_ffn_length: {}", m.n_ff_exp);
+    println!("  shared_ffn_length: {}", m.shared_ffn_length);
+    println!("  has_moe: {}", m.has_moe);
+    println!("  has_shexp: {}", m.has_shexp);
+    println!("  vocab_size: {}", model.vocab_size());
+    println!("  target_layers: {:?}", m.target_layers);
+
+    for (i, layer) in model.layers.iter().enumerate() {
+        let layer_type = if layer.is_moe { "MoE" } else { "Dense" };
+        println!("  layer {} [{}]", i, layer_type);
+    }
+}
+
+pub fn run_target_forward(path: &Path, token_id: usize) {
+    use target::TargetModel;
+    use dflash::dequant_to_f32;
+    use gguf::TensorType;
+    let mut model = TargetModel::load(path).expect("failed to load target model");
+    let n_embd = model.embedding_length();
+    let vocab_size = model.vocab_size();
+    let has_tok_emb = model.tok_embeddings.is_some();
+
+    if has_tok_emb {
+        let n_elements = model.tok_embeddings.as_ref().unwrap().n_elements;
+        if token_id < vocab_size {
+            let raw = model.read_tensor_raw("token_embd.weight")
+                .expect("failed to read tok_embd");
+            let gt = if let Some(t) = model.model.reader.tensor_by_name("token_embd.weight") {
+                t.dtype
+            } else {
+                TensorType::F32
+            };
+            let all_embs = dequant_to_f32(&raw, gt, n_elements);
+            let token_emb: Vec<f32> = (0..n_embd)
+                .map(|i| all_embs[token_id * n_embd + i])
+                .collect();
+            println!("Running target model forward pass with token_id={}", token_id);
+            let (logits, captured) = model.forward_token(&token_emb, None);
+            println!("Forward pass complete: {} logits, {} captured states", logits.len(), captured.len());
+            let mut top: Vec<(f32, usize)> = logits.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            println!("Top logits:");
+            for (v, i) in top.iter().take(10) {
+                println!("  logit[{}] = {}", i, v);
+            }
+            println!("Specific indices:");
+            for (i, v) in logits.iter().enumerate().take(10) {
+                println!("  logit[{}] = {}", i, v);
+            }
+        } else {
+            eprintln!("token_id {} >= vocab_size {}", token_id, vocab_size);
+            std::process::exit(1);
+        }
+    } else {
+        let dummy_input = vec![0.1f32; n_embd];
+        let (logits, captured) = model.forward_token(&dummy_input, None);
+        println!("Forward pass complete: {} logits, {} captured states", logits.len(), captured.len());
+        for (i, v) in logits.iter().enumerate().take(10) {
+            println!("  logit[{}] = {}", i, v);
+        }
+    }
+}
+
+pub fn run_target_dflash(target_path: &Path, dflash_path: &Path, token_id: usize) {
+    use dflash::{dequant_to_f32, DFlashModel};
+    use gguf::TensorType;
+    use target::TargetModel;
+
+    let mut target = TargetModel::load(target_path).expect("failed to load target model");
+    let draft = DFlashModel::load(dflash_path).expect("failed to load DFlash model");
+
+    let n_embd = target.embedding_length();
+    let vocab_size = target.vocab_size();
+    if token_id >= vocab_size {
+        eprintln!("token_id {} >= vocab_size {}", token_id, vocab_size);
+        std::process::exit(1);
+    }
+
+    let n_elements = target.tok_embeddings.as_ref().unwrap().n_elements;
+    let raw = target.read_tensor_raw("token_embd.weight").expect("failed to read tok_embd");
+    let gt = target
+        .model
+        .reader
+        .tensor_by_name("token_embd.weight")
+        .map(|t| t.dtype)
+        .unwrap_or(TensorType::F32);
+    let all_embs = dequant_to_f32(&raw, gt, n_elements);
+    let token_emb: Vec<f32> = (0..n_embd)
+        .map(|i| all_embs[token_id * n_embd + i])
+        .collect();
+
+    let target_layers: Vec<usize> = draft.target_layers().iter().map(|&v| v as usize).collect();
+    println!("DFlash target layers: {:?}", target_layers);
+    let (_target_logits, captured) = target.forward_token(&token_emb, Some(&target_layers));
+    let mut features = Vec::with_capacity(captured.len() * n_embd);
+    for state in &captured {
+        features.extend_from_slice(state);
+    }
+    println!("Captured {} states, {} feature floats", captured.len(), features.len());
+
+    let draft_hidden = draft.forward_injected_decode_hidden(&features, &token_emb);
+    let logits = target.project_normalized_hidden(&draft_hidden);
+    println!("DFlash draft logits: {}", logits.len());
+    let mut top: Vec<(f32, usize)> = logits.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+    top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    println!("Top draft logits:");
+    for (v, i) in top.iter().take(10) {
+        println!("  logit[{}] = {}", i, v);
+    }
+}
+
+fn target_token_embedding(
+    model: &mut target::TargetModel,
+    token_id: usize,
+) -> Vec<f32> {
+    use dflash::dequant_to_f32;
+    use gguf::TensorType;
+
+    let n_embd = model.embedding_length();
+    let vocab_size = model.vocab_size();
+    assert!(token_id < vocab_size, "token_id {} >= vocab_size {}", token_id, vocab_size);
+
+    let n_elements = model.tok_embeddings.as_ref().unwrap().n_elements;
+    let raw = model.read_tensor_raw("token_embd.weight").expect("failed to read tok_embd");
+    let gt = model
+        .model
+        .reader
+        .tensor_by_name("token_embd.weight")
+        .map(|t| t.dtype)
+        .unwrap_or(TensorType::F32);
+    let all_embs = dequant_to_f32(&raw, gt, n_elements);
+    (0..n_embd)
+        .map(|i| all_embs[token_id * n_embd + i])
+        .collect()
+}
+
+fn argmax(logits: &[f32]) -> usize {
+    logits
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+pub fn run_target_dflash_verify(
+    target_path: &Path,
+    dflash_path: &Path,
+    start_token: usize,
+    n_steps: usize,
+) {
+    use dflash::DFlashModel;
+    use target::TargetModel;
+
+    let mut target = TargetModel::load(target_path).expect("failed to load target model");
+    let draft = DFlashModel::load(dflash_path).expect("failed to load DFlash model");
+    let n_embd = target.embedding_length();
+    let target_layers: Vec<usize> = draft.target_layers().iter().map(|&v| v as usize).collect();
+
+    let mut token = start_token;
+    let mut accepted = Vec::with_capacity(n_steps);
+    let mut exact_accepts = 0usize;
+
+    println!("DFlash target layers: {:?}", target_layers);
+    for step in 0..n_steps {
+        let emb = target_token_embedding(&mut target, token);
+        let (target_logits, captured) = target.forward_token(&emb, Some(&target_layers));
+
+        let mut features = Vec::with_capacity(captured.len() * n_embd);
+        for state in &captured {
+            features.extend_from_slice(state);
+        }
+
+        let draft_hidden = draft.forward_injected_decode_hidden(&features, &emb);
+        let draft_logits = target.project_normalized_hidden(&draft_hidden);
+
+        let draft_tok = argmax(&draft_logits);
+        let target_tok = argmax(&target_logits);
+        let accept = draft_tok == target_tok;
+        if accept {
+            exact_accepts += 1;
+        }
+        let next = if accept { draft_tok } else { target_tok };
+        accepted.push(next);
+
+        println!(
+            "step {}: input={} draft={} target={} {} -> accepted={}",
+            step,
+            token,
+            draft_tok,
+            target_tok,
+            if accept { "ACCEPT" } else { "REJECT" },
+            next,
+        );
+        token = next;
+    }
+
+    println!("accepted tokens: {:?}", accepted);
+    println!("exact draft accept rate: {}/{}", exact_accepts, n_steps);
+}
+
+pub fn run_project_ref(path: &Path, hidden_path: &Path) {
+    use target::TargetModel;
+    use std::io::Read;
+
+    let model = TargetModel::load(path).expect("failed to load target model");
+    let n_embd = model.embedding_length();
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(hidden_path)
+        .expect("failed to open hidden file")
+        .read_to_end(&mut bytes)
+        .expect("failed to read hidden file");
+    assert_eq!(bytes.len(), n_embd * 4);
+    let hidden: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let logits = model.project_normalized_hidden(&hidden);
+    let mut top: Vec<(f32, usize)> = logits.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+    top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    println!("Top logits:");
+    for (v, i) in top.iter().take(10) {
+        println!("  logit[{}] = {}", i, v);
+    }
+    println!("Specific indices:");
+    for (i, v) in logits.iter().enumerate().take(8) {
+        println!("  logit[{}] = {}", i, v);
+    }
+}
+
+pub fn run_dump_tensor(path: &std::path::Path, name: &str) {
+    use crate::gguf::GGUFReader;
+    let reader = GGUFReader::open(path).expect("open");
+    if let Some(t) = reader.tensor_by_name(name) {
+        println!("{} shape={:?} dtype={:?} n_elements={}", name, t.shape, t.dtype, t.n_elements());
+    } else {
+        println!("tensor not found: {}", name);
+    }
 }

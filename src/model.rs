@@ -38,8 +38,33 @@ impl Model {
         let head_dim = m.attention_key_length.unwrap_or(0) as usize;
         let expert_count = m.expert_count.unwrap_or(0) as usize;
         let expert_used = m.expert_used_count.unwrap_or(0) as usize;
-        let expert_ffn = m.expert_feed_forward_length.unwrap_or(0) as usize;
-        let shared_ffn = m.expert_shared_feed_forward_length.unwrap_or(0) as usize;
+        let expert_ffn_meta = m.expert_feed_forward_length.unwrap_or(0) as usize;
+        let shared_ffn_meta = m.expert_shared_feed_forward_length.unwrap_or(0) as usize;
+
+        let expert_ffn_from_shape = reader
+            .tensors
+            .iter()
+            .filter_map(|t| {
+                if (t.name.contains("ffn_gate_exps") || t.name.contains("ffn_gate_shexp"))
+                    && t.shape.len() >= 2
+                {
+                    Some(t.shape[1] as usize)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let expert_ffn = if expert_ffn_meta > 0 {
+            expert_ffn_meta
+        } else {
+            expert_ffn_from_shape
+        };
+        let shared_ffn = if shared_ffn_meta > 0 {
+            shared_ffn_meta
+        } else {
+            expert_ffn_from_shape
+        };
 
         let has_moe = reader
             .tensors
@@ -53,24 +78,32 @@ impl Model {
         let target_layers = m.target_layers.clone().unwrap_or_default();
         let is_dflash = m.architecture.as_deref() == Some("dflash");
 
-        let n_expert = if has_moe {
+        let expert_from_shape = reader
+            .tensors
+            .iter()
+            .filter_map(|t| {
+                if t.name.contains("ffn_gate_exps")
+                    && t.shape.len() == 3
+                    && t.shape.last().is_some()
+                {
+                    Some(*t.shape.last().unwrap() as usize)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let n_expert = if expert_count > 0 {
             expert_count
         } else {
-            reader
-                .tensors
-                .iter()
-                .filter_map(|t| {
-                    if t.name.contains("ffn_gate_exps")
-                        && t.shape.len() == 3
-                        && t.shape.last().is_some()
-                    {
-                        Some(*t.shape.last().unwrap() as usize)
-                    } else {
-                        None
-                    }
-                })
-                .max()
-                .unwrap_or(0)
+            expert_from_shape
+        };
+        let n_expert_used = if expert_used > 0 {
+            expert_used
+        } else if expert_from_shape > 0 {
+            10
+        } else {
+            0
         };
 
         Self {
@@ -84,7 +117,7 @@ impl Model {
             rope_dim_swa,
             head_dim,
             n_expert,
-            n_expert_used: expert_used,
+            n_expert_used,
             n_ff_exp: expert_ffn,
             expert_feed_forward_length: expert_ffn,
             shared_ffn_length: shared_ffn,
@@ -135,6 +168,18 @@ impl Model {
         );
         let bytes: Vec<u8> = floats.iter().flat_map(|v| v.to_le_bytes()).collect();
         buffer.upload(&bytes);
+        buffer
+    }
+
+    pub fn upload_tensor_quantized(&mut self, ctx: &crate::vulkan::VulkanContext, tensor: &TensorInfo) -> crate::vulkan::GpuBuffer {
+        let data = self.load_tensor(tensor);
+        let buffer = crate::vulkan::GpuBuffer::new(
+            ctx,
+            data.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+        buffer.upload(&data);
         buffer
     }
 }

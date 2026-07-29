@@ -236,6 +236,31 @@ impl GGUFValue {
         }
     }
 
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            GGUFValue::F32(v) => Some(*v),
+            GGUFValue::F64(v) => Some(*v as f32),
+            GGUFValue::U32(v) => Some(*v as f32),
+            GGUFValue::U64(v) => Some(*v as f32),
+            GGUFValue::I32(v) => Some(*v as f32),
+            GGUFValue::I64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            GGUFValue::Bool(v) => Some(*v),
+            GGUFValue::U32(v) => Some(*v != 0),
+            GGUFValue::U64(v) => Some(*v != 0),
+            GGUFValue::I32(v) => Some(*v != 0),
+            GGUFValue::I64(v) => Some(*v != 0),
+            GGUFValue::F32(v) => Some(*v != 0.0),
+            GGUFValue::F64(v) => Some(*v != 0.0),
+            _ => None,
+        }
+    }
+
     pub fn as_array(&self) -> Option<&[GGUFValue]> {
         match self {
             GGUFValue::Array(arr) => Some(arr),
@@ -532,10 +557,10 @@ fn populate_metadata(metadata: &mut GGUFMetadata, key: &str, value: &GGUFValue) 
         }
         "laguna.attention.layer_norm_rms_epsilon"
         | "dflash.attention.layer_norm_rms_epsilon" => {
-            metadata.attention_layer_norm_rms_epsilon = value.as_u64().map(|v| v as f32);
+            metadata.attention_layer_norm_rms_epsilon = value.as_f32();
         }
         "laguna.rope.freq_base" | "dflash.rope.freq_base" | "rope.freq_base" => {
-            metadata.rope_freq_base = value.as_u64().map(|v| v as f32);
+            metadata.rope_freq_base = value.as_f32();
         }
         "laguna.rope.dimension_count"
         | "dflash.rope.dimension_count"
@@ -546,6 +571,33 @@ fn populate_metadata(metadata: &mut GGUFMetadata, key: &str, value: &GGUFValue) 
         | "dflash.rope.dimension_count_swa"
         | "rope.dimension_count_swa" => {
             metadata.rope_dimension_count_swa = value.as_u64();
+        }
+        "laguna.rope.freq_base_swa" | "dflash.rope.freq_base_swa" | "rope.freq_base_swa" => {
+            metadata.rope_freq_base_swa = value.as_f32();
+        }
+        "laguna.rope.scaling.type" | "dflash.rope.scaling.type" | "rope.scaling.type" => {
+            metadata.rope_scaling_type = value.as_string().map(String::from);
+        }
+        "laguna.rope.scaling.factor" | "dflash.rope.scaling.factor" | "rope.scaling.factor" => {
+            metadata.rope_scaling_factor = value.as_f32();
+        }
+        "laguna.rope.scaling.original_context_length" | "dflash.rope.scaling.original_context_length" => {
+            metadata.rope_scaling_original_context_length = value.as_u64();
+        }
+        "laguna.rope.scaling.yarn_attn_factor" | "dflash.rope.scaling.yarn_attn_factor" => {
+            metadata.rope_scaling_factor = value.as_f32();
+        }
+        "laguna.rope.scaling.yarn_beta_fast" | "dflash.rope.scaling.yarn_beta_fast" => {
+            metadata.rope_scaling_factor = value.as_f32();
+        }
+        "laguna.rope.scaling.yarn_beta_slow" | "dflash.rope.scaling.yarn_beta_slow" => {
+            metadata.rope_scaling_factor = value.as_f32();
+        }
+        "laguna.expert_weights_norm" | "dflash.expert_weights_norm" | "expert_weights_norm" => {
+            metadata.expert_weights_norm = value.as_bool();
+        }
+        "laguna.expert_weights_scale" | "dflash.expert_weights_scale" | "expert_weights_scale" => {
+            metadata.expert_weights_scale = value.as_f32();
         }
         "laguna.attention.sliding_window" | "dflash.attention.sliding_window" => {
             metadata.attention_sliding_window = value.as_u64();

@@ -23,6 +23,7 @@ layout(push_constant) uniform Push {
     uint head_dim;
     uint rope_dim;
     float eps;
+    uint pos;
 };
 
 void main() {
@@ -49,9 +50,9 @@ void main() {
         y[i] = normed;
     } else {
         uint hf = dim % (rope_dim / 2u);
-        float f = freq[hf];
-        float cos_f = cos(f);
-        float sin_f = sin(f);
+        float angle = freq[hf] * float(pos);
+        float cos_f = cos(angle);
+        float sin_f = sin(angle);
 
         if (dim < rope_dim / 2u) {
             uint pair_idx = i + head_dim / 2u;

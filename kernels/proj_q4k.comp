@@ -1,0 +1,92 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) readonly buffer InX {
+    float x[];
+};
+
+layout(binding = 1, std430) readonly buffer InW {
+    uint w_data[];
+};
+
+layout(binding = 2, std430) writeonly buffer OutC {
+    float c[];
+};
+
+layout(push_constant) uniform Push {
+    uint k;
+    uint n;
+    uint expert_offset;
+};
+
+uint read_byte(uint offset) {
+    uint word = w_data[offset / 4u];
+    return (word >> ((offset % 4u) * 8u)) & 0xFFu;
+}
+
+float fp16_to_f32(uint h_bits) {
+    uint sign = h_bits & 0x8000u;
+    uint exp = (h_bits >> 10u) & 0x1Fu;
+    uint mant = h_bits & 0x3FFu;
+
+    if (exp == 0u) {
+        if (mant == 0u) return uintBitsToFloat(sign << 16u);
+        return uintBitsToFloat((sign << 16u) | ((1u - 15u + 127u) << 23u) | (mant << 13u));
+    }
+    if (exp == 31u) {
+        if (mant == 0u) return uintBitsToFloat((sign << 16u) | 0x7F800000u);
+        return uintBitsToFloat((sign << 16u) | 0x7F800000u | (mant << 13u));
+    }
+
+    uint f_bits = (sign << 16u) | (((exp - 15u + 127u) << 23u)) | (mant << 13u);
+    return uintBitsToFloat(f_bits);
+}
+
+void get_scale_min_k4(uint j, uint scales_off, out uint d, out uint m) {
+    uint b0 = read_byte(scales_off + j);
+    uint b4 = read_byte(scales_off + 4u + (j & 3u));
+    uint bp = read_byte(scales_off + 8u + (j & 3u));
+    if (j < 4u) {
+        d = b0 & 63u;
+        m = b4 & 63u;
+    } else {
+        uint d_hi = read_byte(scales_off + j - 4u);
+        d = (bp & 15u) | ((d_hi >> 6u) << 4u);
+        m = (bp >> 4u) | ((b4 >> 6u) << 4u);
+    }
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+
+    float acc = 0.0;
+
+    for (uint j = 0u; j < k; j++) {
+        uint lin = expert_offset + i * k + j;
+        uint blk = lin / 256u;
+        uint elm = lin % 256u;
+        uint blk_off = blk * 144u;
+
+        uint d_bits = read_byte(blk_off) | (read_byte(blk_off + 1u) << 8u);
+        float d = fp16_to_f32(d_bits);
+        uint dmin_bits = read_byte(blk_off + 2u) | (read_byte(blk_off + 3u) << 8u);
+        float dmin_f = fp16_to_f32(dmin_bits);
+
+        uint sb = elm / 32u;
+        uint group64 = elm / 64u;
+        uint within64 = elm % 64u;
+        uint q_byte_off = blk_off + 16u + group64 * 32u + (within64 % 32u);
+        uint q_byte = read_byte(q_byte_off);
+        float q = float((within64 < 32u) ? (q_byte & 0xFu) : ((q_byte >> 4u) & 0xFu));
+
+        uint d_sc, m_sc;
+        get_scale_min_k4(sb, blk_off + 4u, d_sc, m_sc);
+
+        float w = d * float(d_sc) * q - dmin_f * float(m_sc);
+        acc += x[j] * w;
+    }
+
+    c[i] = acc;
+}

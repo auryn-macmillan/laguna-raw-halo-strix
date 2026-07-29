@@ -1,0 +1,75 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) readonly buffer InQ {
+    float Q[];
+};
+
+layout(binding = 1, std430) readonly buffer InK {
+    float K[];
+};
+
+layout(binding = 2, std430) readonly buffer InV {
+    float V[];
+};
+
+layout(binding = 3, std430) writeonly buffer OutAttn {
+    float out_attn[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_q_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint seq_len;
+    float scale;
+    uint q_pos;
+    uint causal;
+};
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    uint h = d / head_dim;
+    uint dim = d % head_dim;
+    if (h >= n_q_heads) return;
+
+    uint kv_h = h * n_kv_heads / n_q_heads;
+
+    float max_score = -1e30;
+    float scores[64];
+    uint n = seq_len;
+    if (n > 64u) n = 64u;
+
+    uint q_base = h * head_dim;
+
+    for (uint p = 0u; p < n; p++) {
+        if (causal != 0u && p > q_pos) {
+            scores[p] = -1e30;
+            continue;
+        }
+
+        uint k_base = p * n_kv_heads * head_dim + kv_h * head_dim;
+        float dot = 0.0;
+        for (uint j = 0u; j < head_dim; j++) {
+            dot += Q[q_base + j] * K[k_base + j];
+        }
+        scores[p] = dot * scale;
+
+        if (scores[p] > max_score) max_score = scores[p];
+    }
+
+    float sum_exp = 0.0;
+    for (uint p = 0u; p < n; p++) {
+        sum_exp += exp(scores[p] - max_score);
+    }
+
+    float result = 0.0;
+    for (uint p = 0u; p < n; p++) {
+        float weight = exp(scores[p] - max_score) / sum_exp;
+        uint v_base = p * n_kv_heads * head_dim + kv_h * head_dim;
+        result += weight * V[v_base + dim];
+    }
+
+    out_attn[d] = result;
+}

@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, std430) readonly buffer InAttn {
+    float attn[];
+};
+
+layout(binding = 1, std430) readonly buffer InGate {
+    float gate[];
+};
+
+layout(binding = 2, std430) writeonly buffer OutResult {
+    float result[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_heads;
+    uint head_dim;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint hd = n_heads * head_dim;
+    if (i >= hd) return;
+
+    uint head = i / head_dim;
+    float g_val = gate[head];
+    float g = log(1.0 + exp(g_val));
+    result[i] = attn[i] * g;
+}

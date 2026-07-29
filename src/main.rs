@@ -14,6 +14,8 @@ fn main() {
         eprintln!("  test-matmul               - test matmul on GPU");
         eprintln!("  test-rmsnorm              - test rmsnorm on GPU");
         eprintln!("  test-rope                 - test rope on GPU");
+        eprintln!("  target-forward <gguf> <tok> - run target model forward pass");
+        eprintln!("  target-info <gguf>        - show target model info");
         std::process::exit(1);
     }
 
@@ -51,6 +53,45 @@ fn main() {
         }
         "test-rope" => {
             laguna_raw::run_test_rope();
+        }
+        "target-forward" => {
+            let path = Path::new(&args[2]);
+            let token_id: usize = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            laguna_raw::run_target_forward(path, token_id);
+        }
+        "target-info" => {
+            let path = Path::new(&args[2]);
+            laguna_raw::run_target_info(path);
+        }
+        "target-dflash" => {
+            let target = Path::new(&args[2]);
+            let dflash = Path::new(&args[3]);
+            let token_id: usize = args
+                .get(4)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            laguna_raw::run_target_dflash(target, dflash, token_id);
+        }
+        "target-dflash-verify" => {
+            let target = Path::new(&args[2]);
+            let dflash = Path::new(&args[3]);
+            let token_id: usize = args
+                .get(4)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let n_steps: usize = args
+                .get(5)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4);
+            laguna_raw::run_target_dflash_verify(target, dflash, token_id, n_steps);
+        }
+        "project-ref" => {
+            let path = Path::new(&args[2]);
+            let hidden = Path::new(&args[3]);
+            laguna_raw::run_project_ref(path, hidden);
         }
         _ => {
             eprintln!("unknown command: {}", command);
